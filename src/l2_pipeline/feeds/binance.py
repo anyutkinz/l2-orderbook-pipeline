@@ -9,7 +9,6 @@ import random
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager
 from decimal import Decimal
 from typing import Any, Protocol, cast
 
@@ -24,6 +23,7 @@ from l2_pipeline.feeds.ratelimit import (
     DEFAULT_SNAPSHOT_BUCKET_REFILL_PER_SEC,
     TokenBucket,
 )
+from l2_pipeline.feeds.transport import WebSocketConnector, WebSocketLike
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +82,6 @@ def parse_snapshot(data: dict[str, Any]) -> SnapshotEvent:
     except (KeyError, ValueError, TypeError, decimal.InvalidOperation) as exc:
         raise ParseError(str(exc)) from exc
     return SnapshotEvent(last_update_id=last_update_id, bids=bids, asks=asks)
-
-
-class WebSocketLike(Protocol):
-    async def recv(self) -> str | bytes: ...
-    async def close(self) -> None: ...
-
-
-WebSocketConnector = Callable[[str], AbstractAsyncContextManager[WebSocketLike]]
 
 
 class HttpResponseLike(Protocol):
