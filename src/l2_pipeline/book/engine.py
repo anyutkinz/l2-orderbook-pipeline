@@ -111,6 +111,28 @@ class BookEngine:
     def full_book(self) -> tuple[dict[Decimal, Decimal], dict[Decimal, Decimal]]:
         return dict(self._bids), dict(self._asks)
 
+    def invalidate(self, reason: str) -> None:
+        """Force a fresh sync regardless of current state, discarding book
+        contents, the checkpoint, and any buffered events. For callers
+        (e.g. a feed client after a reconnect) that know a resync is
+        needed without waiting for the engine's own chain-check to
+        (maybe) discover it independently. `reason` is accepted only for
+        the caller's own logging.
+
+        Stays BUFFERING if called while already BUFFERING (a true cold
+        start, e.g. the first connection attempt dying before ever
+        reaching LIVE) rather than relabeling it RESYNCING -- that
+        distinction is what M6's resync counters rely on to tell
+        "recovering" apart from "starting up".
+        """
+        del reason
+        if self._state is not BookState.BUFFERING:
+            self._state = BookState.RESYNCING
+        self._bids = {}
+        self._asks = {}
+        self._last_applied_id = None
+        self._buffer = []
+
     def _apply_live(self, event: DiffEvent) -> ApplyResult:
         if event.prev_id != self._last_applied_id:
             detail = (

@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Multi-exchange L2 order book ingestion and reconstruction pipeline"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "httpx>=0.28.1",
     "pyyaml>=6.0",
+    "websockets>=16.1",
 ]
 
 [dependency-groups]

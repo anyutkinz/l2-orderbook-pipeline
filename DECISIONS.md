@@ -335,3 +335,203 @@ of generation vs. order of application silently diverging — and it was
 caught by the property layer, not the eight hand-written scenarios,
 none of which happened to construct this specific interleaving.
 
+## M3 — Live Binance feed client
+
+### `BinanceFeedClient` is the production twin of `SimulatedFeedDriver`
+
+Same control loop, same shape: GAP_DETECTED-or-cold-start triggers a
+fetch-snapshot-and-load cycle with bounded retry on staleness.
+`FaultInjector.poll()` is replaced by a real websocket stream;
+`FaultInjector.request_snapshot()` is replaced by a real REST call.
+`MarketSimulator` ≈ exchange internals, the injector ≈ the network,
+`SimulatedFeedDriver`/`BinanceFeedClient` ≈ the feed client, `BookEngine`
+≈ itself, completely unchanged between M2 and M3. The only things that
+changed crossing from M2 to M3 are the two outer layers that touch the
+outside world; the recovery *logic* was already fully proven by M2's
+fault-storm and Hypothesis runs before a single real socket opened here.
+
+### Two independent state machines, never merged
+
+`ConnectionManager` (transport: DISCONNECTED/CONNECTING/CONNECTED/BACKOFF)
+and `BookEngine`'s own state (BUFFERING/RESYNCING/LIVE) track genuinely
+different things and must stay separate. `ConnectionManager` has zero
+opinion about book validity; `BookEngine` has zero opinion about sockets.
+The only coupling is one direction, explicit, and asymmetric: a new
+connection *forces* `invalidate()` on the book (via the coupling rule
+below), but a book resync never touches connection state. Merging them
+into one state machine would create meaningless combined states (what
+does "CONNECTED + BUFFERING" mean as a single enum value that
+"CONNECTING + BUFFERING" doesn't already cover?) and couple two concerns
+that change for different reasons, at different rates, for different
+reasons entirely.
+
+### Coupling rule: every reconnect forces `invalidate()`, not relying on chain-check gap detection
+
+Added `BookEngine.invalidate(reason)` (M1 API extension, same pattern as
+`full_book()`): forces `RESYNCING` (or leaves `BUFFERING` alone if never
+LIVE yet) from any state, discarding book contents, checkpoint, and
+buffer. Missed events during a WS outage are near-certain, and the
+engine's own chain-check *would* probably catch it on the first event
+after reconnect anyway — but "probably" isn't good enough for a coupling
+this important. Defense in depth: don't rely on an emergent property
+when an explicit one is one method call away.
+
+### Backoff + full jitter (AWS lineage)
+
+`delay = uniform(0, min(cap, base * 2**attempt))` is literally AWS's
+"full jitter" formula from their well-known backoff blog post
+(`base=0.5s, cap=30s` here). Rejected alternatives: no jitter (a fleet of
+reconnecting clients would thunder-herd in lockstep against Binance after
+any shared outage — not a concern at N=1 client, but a bad habit to
+build); "equal jitter" (`cap/2 + uniform(0, min(cap, base*2**attempt)/2)`,
+AWS's more conservative alternative) trades lower minimum delay for a
+higher floor — full jitter's wider spread is the better fit for spreading
+out reconnect load when doing this alone. `ConnectionManager` never
+sleeps itself; it returns the delay for the caller to `await`, which is
+what makes it testable with a fake clock and RNG (T1), no event loop
+needed.
+
+### Watchdog is message-based, not ping/pong-based
+
+Rely on the `websockets` library's built-in ping/pong for protocol-level
+keepalive (unchanged, out of our code entirely) — but that only proves
+the *transport* is alive, not that Binance is actually sending us book
+updates. A watchdog that only checked ping/pong would miss a connection
+that's technically open but has silently stopped producing depth events
+(the specific failure mode this exists to catch). Implemented as
+`asyncio.wait_for(ws.recv(), timeout=watchdog_timeout)` around every
+receive — if `BTCUSDT@depth@100ms` (nominally an update every ~100ms)
+goes quiet for `watchdog_timeout` (default 10s), we declare the
+connection dead ourselves rather than trusting the transport layer's
+opinion of its own health.
+
+### Token bucket sizing: weight verified live, not from memory
+
+`GET /api/v3/depth` weight was checked directly against
+developers.binance.com at implementation time (not recalled from
+training data, which can be stale and the table has changed over
+Binance's API history): 5 at `limit<=100`, 25/50/250 at the higher
+tiers. We fetch at `limit=100` — 5x `book.depth_levels=20`, comfortable
+margin, cheapest tier. Overall budget (confirmed): 6000
+REQUEST_WEIGHT/minute per IP, reported via
+`X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter)` response headers,
+logged at debug level on *every* snapshot fetch (not just 429/418) so
+real consumption is observable during A1 even when nothing's going
+wrong. `capacity=10, refill_rate=0.5/sec` sizing rationale is in
+`ratelimit.py`'s module docstring, next to the verified numbers it's
+derived from.
+
+The general pattern here — token-bucket rate limiting in front of REST
+calls, respecting `Retry-After` on 429/418, logging used-weight headers
+for observability — is standard practice in production crypto feed
+handlers (cryptofeed, NautilusTrader, and similar open-source exchange
+connectivity libraries all implement some form of it). Citing that as
+"this is an established pattern, not something invented here," not as a
+claim of having read those codebases line-by-line in this session.
+
+`TokenBucket` itself stays fully synchronous (no `asyncio.sleep` inside)
+— it answers "how long" via `time_until_available()`, the caller in
+`binance.py` does the actual `await asyncio.sleep(...)`. Same reasoning
+as `ConnectionManager`: keeping the decision-making pure is what makes
+T2 testable with a fake clock and zero event loop.
+
+### Two separate retry loops, not one
+
+`_fetch_snapshot()` has its own bounded retry loop for HTTP-level issues
+(429/418, `Retry-After`-driven), separate from `_perform_resync()`'s
+protocol-level retry loop (`SNAPSHOT_STALE`/`GAP_DETECTED`, capped at 20,
+carried over from M2). Conflating them would mean a rate-limit backoff
+retry burns down the same budget meant for protocol-level staleness
+retries — two different failure classes with two different appropriate
+retry budgets and backoff shapes, kept structurally separate rather than
+sharing one counter that would silently mean different things depending
+on which failure mode happened to fire first.
+
+### `load_snapshot()` can return `GAP_DETECTED`, not just `SNAPSHOT_STALE` — caught before shipping in a test
+
+First draft of `_perform_resync()` treated any non-`APPLIED` result as
+"stale, retry" — but `load_snapshot()`'s buffer-replay loop can also
+return `GAP_DETECTED` (the snapshot itself was accepted, but a *later*
+buffered event failed to chain during replay). That's a genuinely
+different cause than staleness, even though the recovery action (fetch a
+fresh snapshot) happens to be identical either way. Caught while
+hand-tracing the scenario T5 was about to encode — fixed to log the
+correct incident type for each cause before the test could quietly bake
+in the wrong label as "expected" behavior.
+
+### Bug found empirically: cold-start double resync
+
+First live run against real Binance showed two `RESYNC_COMPLETED`
+incidents at startup instead of one. Root cause: the constructor
+pre-set `_resync_needed` for "cold start needs an initial sync" — but
+`run()`'s reconnect loop *already* calls `invalidate()` +
+`resync_needed.set()` unconditionally on every connection including the
+first. The pre-set let `_resync_worker` race ahead of the WS handshake:
+it grabbed an empty buffer, fetched a snapshot, and completed a trivial
+resync *before the websocket had even finished connecting* — which the
+coupling rule then immediately discarded via `invalidate()` once the
+real connection came up, forcing a second, real resync. Not incorrect
+(no invariant violated, no bad state), but wasteful (an extra REST call
+every cold start) and confusing in the logs. Fixed by removing the
+redundant pre-set; `run()`'s existing per-connection trigger already
+covers cold start correctly on its own.
+
+### `events_buffered` in `RESYNC_COMPLETED` logs can undercount
+
+It resets when `_perform_resync()` *starts*, but the reader loop and the
+resync worker are separate coroutines — messages can buffer before the
+resync task is even scheduled to run, and those don't get counted. It's
+a debug-observability figure only; nothing in the apply/convergence logic
+depends on its precision, and inflating its apparent precision would be
+the kind of fake rigor this project explicitly rules out. Documented
+plainly in the code rather than silently shipped as if exact.
+
+### Windows signal handling: `add_signal_handler` with a `KeyboardInterrupt` fallback
+
+`loop.add_signal_handler()` is POSIX-only — raises `NotImplementedError`
+on Windows. `main()` tries it for both SIGINT and SIGTERM (works cleanly
+on Linux, where this could plausibly run in CI or on a server) and falls
+back to relying on `KeyboardInterrupt` propagating through the running
+coroutine on Ctrl+C, caught by a `try/finally` around `run()`'s body that
+unconditionally closes the websocket/HTTP client and logs final stats
+regardless of which path triggered it.
+
+Verified manually, not just reasoned about: git-bash/MSYS (this
+project's default shell in the agent environment) does not appear to
+attach a real Win32 console, so `GenerateConsoleCtrlEvent`-based Ctrl+C
+simulation from that shell silently did nothing — confirmed down to a
+minimal `asyncio.sleep()`-only repro with no project code involved, so
+it's an environment property, not an app bug. Run manually from a real
+PowerShell console instead: Ctrl+C correctly raised `KeyboardInterrupt`,
+propagated through `CancelledError` into the `finally` block, ran
+cleanup, and `main()` caught the re-raised `KeyboardInterrupt` cleanly
+(exit code 0). See the M3 walkthrough for the literal output.
+
+### Periodic heartbeat, separate from incident logging
+
+Added after the live Ctrl+C run surfaced a real gap: steady-state
+`apply_event()` calls are deliberately silent (counted, not logged) by
+the event-driven incident-logging design, which means a long unattended
+run gives no signal to distinguish "silently healthy" from "silently
+stalled" without interrupting the process. `_heartbeat_worker()` is a
+third persistent background task (alongside `_resync_worker`), logging
+`messages_received` / `connection_state` / `book_state` at INFO level
+every `heartbeat_interval_seconds` (default 30s, configurable). Doesn't
+touch the incident-logging design — deliberately not tagged as an
+`incident` in the structured log, since it isn't one; it's a liveness
+pulse, checked in against `get_stats()`'s existing fields rather than
+adding new bookkeeping.
+
+### Guarding the "no lock needed" concurrency argument with a test, not just a comment
+
+The reader loop and `_resync_worker` both call `BookEngine` methods
+concurrently without a lock, safe only because no `BookEngine` method
+contains an `await` — under asyncio's cooperative scheduling, each call
+runs to completion with no yield point for the event loop to interleave
+on. That argument used to live only in a comment, which nothing stops a
+future change (M4's OKX logic landing in the same `book/` package,
+for instance) from silently violating. `test_book_engine_has_no_async_methods`
+(in M1's `test_book_engine.py`, since it protects an M1 invariant that
+M3 merely depends on and documents) enforces it mechanically: it fails
+loudly the moment any `BookEngine` method becomes a coroutine function.
+

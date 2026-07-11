@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from decimal import Decimal
 
 import pytest
@@ -13,6 +14,7 @@ from l2_pipeline.book import (
     SnapshotEvent,
     apply_levels,
 )
+from l2_pipeline.book import engine as engine_module
 
 
 def _snapshot(
@@ -196,3 +198,67 @@ def test_load_snapshot_while_live_raises() -> None:
 
     with pytest.raises(ValueError, match="LIVE"):
         engine.load_snapshot(_snapshot(2000, [], []))
+
+
+# M3 addition: invalidate() forces a fresh sync from any state
+def test_invalidate_from_live_forces_resyncing_and_discards_book() -> None:
+    engine = _live_engine(1000, bids=[("100", "1")], asks=[("101", "1")])
+    engine.apply_event(_event(1000, 1001, bids=[("100", "2")]))
+
+    engine.invalidate("reconnect")
+
+    assert engine.state is BookState.RESYNCING
+    assert engine.last_applied_id is None
+    assert engine.full_book() == ({}, {})
+
+
+def test_invalidate_from_buffering_stays_buffering() -> None:
+    engine = BookEngine(depth_levels=20)
+    engine.apply_event(_event(1190, 1198, bids=[("50", "9")]))
+
+    engine.invalidate("reconnect before ever reaching LIVE")
+
+    assert engine.state is BookState.BUFFERING
+    assert engine.last_applied_id is None
+
+
+def test_invalidate_discards_buffered_events() -> None:
+    engine = BookEngine(depth_levels=20)
+    engine.apply_event(_event(1195, 1205, bids=[("100", "7")]))  # would have straddled a snapshot
+
+    engine.invalidate("reconnect")
+
+    # the pre-invalidate buffered event must not be replayed against a
+    # snapshot that arrives after invalidate() -- it's discarded, not kept
+    result = engine.load_snapshot(_snapshot(1200, bids=[("100", "1")], asks=[]))
+    assert result.status is ApplyStatus.APPLIED
+    assert engine.last_applied_id == 1200
+    bids, _ = engine.top_levels()
+    assert bids == [
+        PriceLevel(Decimal("100"), Decimal("1"))
+    ]  # snapshot's value, not the discarded "7"
+
+
+def test_invalidate_from_resyncing_stays_resyncing() -> None:
+    engine = _live_engine(1010)
+    engine.apply_event(_event(1015, 1020))  # gap -> RESYNCING
+    assert engine.state is BookState.RESYNCING
+
+    engine.invalidate("reconnect")
+
+    assert engine.state is BookState.RESYNCING
+    assert engine.last_applied_id is None
+
+
+# M3 addition: guards the "no lock needed" concurrency argument documented
+# in DECISIONS.md -- BinanceFeedClient's reader loop and resync worker
+# both call BookEngine methods without a lock, safe only because no method
+# here contains an await (each call runs to completion with no yield point
+# for the event loop to interleave on). This test fails loudly if a future
+# change (e.g. M4's OKX logic landing in this package) violates that.
+def test_book_engine_has_no_async_methods() -> None:
+    for name, member in inspect.getmembers(engine_module.BookEngine):
+        assert not inspect.iscoroutinefunction(member), (
+            f"{name} is async -- this breaks the no-lock concurrency "
+            f"safety argument documented in DECISIONS.md M3 entry"
+        )

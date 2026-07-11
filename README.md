@@ -54,11 +54,14 @@ src/l2_pipeline/
   feeds/          # per-exchange WS + REST clients — M3/M4
   sinks/          # Parquet writer, Prometheus metrics — M5/M6
 tests/
-  unit/           # book engine + config unit tests
+  unit/           # book engine + config unit tests + M3 feed-client tests
   simulation/      # deterministic simulation + fault-injection harness — M2
+  fixtures/binance/ # golden-file WS/REST payloads, captured live — M3
 ```
 
 ## Status
 
 Work-in-progress portfolio project, built milestone by milestone. Currently:
-M2 (deterministic simulation harness with fault injection + Hypothesis).
+M3 (live Binance feed client: WS + REST, official sync protocol,
+backoff+jitter reconnection, watchdog, rate-limited snapshot fetches,
+graceful shutdown, structured incident logging + heartbeat).
