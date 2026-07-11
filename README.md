@@ -55,10 +55,10 @@ src/l2_pipeline/
   sinks/          # Parquet writer, Prometheus metrics — M5/M6
 tests/
   unit/           # book engine + config unit tests
-  synthetic/       # fault-injection harness — M2
+  simulation/      # deterministic simulation + fault-injection harness — M2
 ```
 
 ## Status
 
 Work-in-progress portfolio project, built milestone by milestone. Currently:
-M0 (project skeleton, config, logging, CI).
+M2 (deterministic simulation harness with fault injection + Hypothesis).

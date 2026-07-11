@@ -108,6 +108,9 @@ class BookEngine:
         asks = [PriceLevel(price, qty) for price, qty in sorted(self._asks.items())[:limit]]
         return bids, asks
 
+    def full_book(self) -> tuple[dict[Decimal, Decimal], dict[Decimal, Decimal]]:
+        return dict(self._bids), dict(self._asks)
+
     def _apply_live(self, event: DiffEvent) -> ApplyResult:
         if event.prev_id != self._last_applied_id:
             detail = (

@@ -220,3 +220,118 @@ avoid float precision issues on the wire. Parsing directly via
 first would throw that guarantee away for no benefit — an easy, avoidable
 correctness gap in a project meant to demonstrate rigor.
 
+### Addendum (M2): `BookEngine.full_book()`
+
+Added after M1 shipped, to support the M2 differential-testing harness's
+convergence checker, which needs to compare the engine's *entire* internal
+ladder against a ground-truth oracle — `top_levels(n)` always sorts and
+truncates to a configured depth, so using it with an arbitrarily large `n`
+to fake a full dump would be an abuse of a method meant for "top N levels
+to persist." `full_book()` returns defensive copies of the internal bid/ask
+dicts, so callers can't mutate engine state through the returned objects.
+
+## M2 — Deterministic simulation + fault injection
+
+### Lineage: a mini deterministic-simulation-testing (DST) harness
+
+The design borrows three specific patterns from FoundationDB's and
+TigerBeetle's testing methodology, scoped down to fit a single-process,
+synchronous, no-network M2 milestone:
+
+1. **Seed-based determinism** — the entire run (market dynamics, fault
+   timing, fault types) is driven by one integer seed; same seed
+   reproduces bit-for-bit. This is what makes a failing run replayable
+   from just the seed, not from a saved event log.
+2. **Differential/model-based testing** — a ground-truth oracle (the
+   market simulator's own internal ladder, updated unconditionally,
+   never touched by fault injection) runs alongside the real
+   `BookEngine`. Correctness is bit-exact convergence of the engine to
+   the oracle, not a hand-picked set of expected outputs.
+3. **Property-based exploration on top of the deterministic scenarios**
+   (Hypothesis) — searches the space of seeds/fault-configs/step-counts
+   for a combination the hand-written scenarios (S1-S8) didn't think of.
+
+The full versions of these systems test entire distributed clusters
+under simulated network partitions, disk corruption, and clock skew,
+with a custom deterministic runtime replacing the OS scheduler. That's
+out of scope here by design: M2 is single-process, fully synchronous, no
+asyncio, no real network — determinism first, so every later milestone
+(especially the real async feed clients in M3/M4) can be tested against
+this harness without the harness itself needing to be debugged under
+concurrency.
+
+### Two independent RNG streams from one seed
+
+If `MarketSimulator` and `FaultInjector` shared one `random.Random`
+instance, adding or removing any random draw in one component would
+silently shift what the other draws on the *same* seed — determinism
+would hold in the narrow sense (same seed still reproduces *a* run) but
+break in the useful sense (a harmless refactor changes what every
+existing seed produces, making old bug reports unreproducible). Fix:
+`derive_seed(seed, label)` hashes `f"{seed}:{label}"` through a throwaway
+`random.Random` to produce an independent child seed per label; each
+component takes an already-derived seed and constructs its own
+`random.Random` internally — never a shared instance passed in from
+outside. `build_simulation()` is the single place derivation happens.
+
+### Fault precedence + shadowed-fault logging
+
+Multiple faults can roll "true" on the same tick (e.g. `DROP_ONE` and
+`DUPLICATE` both firing). Rather than let them combine into nonsensical
+states, a fixed precedence applies, first match wins: active
+window (`DISCONNECT`/`DROP_BURST` in progress) → `DISCONNECT` →
+`DROP_BURST` → `DROP_ONE` → `DUPLICATE` → `REORDER` → deliver normally.
+
+Every fault type is still rolled independently first (not short-circuit
+evaluated), so a type that rolled true but lost to a higher-precedence
+type gets logged as `shadowed=True` rather than silently disappearing.
+Without this, a high-probability fault type could statistically starve a
+lower-precedence one in a long run and nobody would notice — the S8
+fault-storm test asserts every configured fault type actually *fired*
+at least once, and the shadowed counts make starvation visible instead
+of hidden if that assertion ever needs loosening.
+
+One simplification: while an active window is suppressing delivery, no
+other fault types are rolled *at all* that tick (not rolled-and-shadowed
+— not rolled). Window suppression already determines delivery
+unconditionally; computing "what would have happened instead" adds
+noise, not information, for those ticks. Shadowed counts reflect ticks
+where multiple ad hoc rolls genuinely competed, not ticks preempted by
+an in-progress window.
+
+### `@given`, not `RuleBasedStateMachine`
+
+Hypothesis's stateful testing exists for when the tool needs to
+*discover* an operation sequence by interleaving rule calls itself —
+valuable when the sequence space isn't already captured by a compact
+parameter set. Here it already is: `(seed, FaultConfig, num_steps)`
+fully determines an entire run, faults included, by construction (that's
+the seed-determinism property above). Modeling faults as Hypothesis
+rules would mean reimplementing `FaultInjector`'s job a second time
+inside the state machine's rule set, and would lose the "one seed
+reproduces everything" property already built in. `@given` over a
+composite strategy that draws seed + fault probabilities + step count,
+running the whole deterministic simulation as one property-function
+body, is the correctly-sized tool for a system that's already
+seed-driven rather than one Hypothesis needs to drive itself.
+
+### Bug Hypothesis actually found: simultaneous bid/ask inserts could cross
+
+`MarketSimulator.step()` originally generated bid-side and ask-side
+changes independently, both clamped against a `best_bid`/`best_ask`
+snapshot taken *before either was applied*, then applied both at the
+end. If both sides happened to insert in the same tick, each clamp was
+correct in isolation (a new bid can't cross the *old* best ask; a new
+ask can't cross the *old* best bid) but said nothing about whether the
+two new prices crossed *each other* — and when the existing spread was
+at least `2 * spread_min`, they could. H1 found this within its
+configured `max_examples=200`, shrunk to seed 1615, an all-zero
+`FaultConfig` (proving it was a pure market-generation bug, unrelated to
+fault injection), 60 steps. Fix: apply each side's change immediately
+after generating it, so a same-tick second insert clamps against the
+*current* (already-updated) opposite price instead of a stale snapshot.
+This is exactly the class of bug this harness exists to catch — order
+of generation vs. order of application silently diverging — and it was
+caught by the property layer, not the eight hand-written scenarios,
+none of which happened to construct this specific interleaving.
+
