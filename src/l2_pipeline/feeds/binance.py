@@ -17,7 +17,7 @@ import httpx
 from l2_pipeline.book.engine import BookEngine
 from l2_pipeline.book.types import ApplyStatus, BookState, DiffEvent, PriceLevel, SnapshotEvent
 from l2_pipeline.feeds.connection import BackoffPolicy, ConnectionManager
-from l2_pipeline.feeds.envelope import TimestampedEvent
+from l2_pipeline.feeds.envelope import InstrumentId, TimestampedEvent
 from l2_pipeline.feeds.ratelimit import (
     DEFAULT_SNAPSHOT_BUCKET_CAPACITY,
     DEFAULT_SNAPSHOT_BUCKET_REFILL_PER_SEC,
@@ -265,7 +265,11 @@ class BinanceFeedClient:
                 self._stats["malformed_message"] += 1
                 continue
 
-            timestamped = TimestampedEvent(ts_local_ns=ts_local_ns, event=diff)
+            timestamped = TimestampedEvent(
+                ts_local_ns=ts_local_ns,
+                instrument=InstrumentId("binance", self._symbol),
+                event=diff,
+            )
             logger.debug(
                 "event received",
                 extra={
