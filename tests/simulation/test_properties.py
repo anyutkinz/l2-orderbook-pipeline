@@ -20,7 +20,18 @@ def fault_configs(draw: st.DrawFn) -> FaultConfig:
         reorder_prob=draw(st.floats(0.0, 0.2)),
         disconnect_prob=draw(st.floats(0.0, 0.05)),
         disconnect_max_len=draw(st.integers(1, 20)),
-        delayed_snapshot_prob=draw(st.floats(0.0, 0.8)),
+        # Capped at 0.4, not 1.0: each resync attempt independently rolls
+        # this probability, and SimulatedFeedDriver has a fixed retry
+        # budget (20). At p=0.8 this test found (seed=427) that ~20
+        # consecutive "stale" rolls -- p**20 ~= 1.1% per example, enough to
+        # hit within max_examples=200 -- exhausts the budget by pure
+        # variance, with every individual rejection correct (the straddle
+        # check has exactly one valid last_update_id to land on). Not a
+        # logic bug: an 80%-stale-snapshot network isn't realistic, and
+        # SimulatedFeedDriver deliberately treats budget exhaustion as
+        # fatal (loud failure, not silent hang -- see DECISIONS.md M2).
+        # p<=0.4 makes p**20 ~= 1e-8, negligible even across many runs.
+        delayed_snapshot_prob=draw(st.floats(0.0, 0.4)),
         delayed_snapshot_max_steps=draw(st.integers(1, 8)),
     )
 
