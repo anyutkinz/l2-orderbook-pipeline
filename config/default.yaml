@@ -1,0 +1,25 @@
+exchanges:
+  - name: binance
+    symbols: ["BTCUSDT"]
+    ws_url: "wss://stream.binance.com:9443/ws"
+    rest_snapshot_url: "https://api.binance.com/api/v3/depth"
+  - name: okx
+    symbols: ["BTC-USDT"]
+    ws_url: "wss://ws.okx.com:8443/ws/v5/public"
+    # OKX pushes the initial full snapshot as the first "books" WS message;
+    # there is no separate REST snapshot call, unlike Binance.
+
+book:
+  depth_levels: 20
+
+output:
+  parquet_dir: "./data"
+  queue_maxsize: 10000
+  overflow_policy: "drop_oldest"
+
+metrics:
+  prometheus_port: 9100
+
+logging:
+  level: "INFO"
+  format: "json"
