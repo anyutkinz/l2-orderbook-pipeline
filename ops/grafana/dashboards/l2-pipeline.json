@@ -154,12 +154,91 @@
       "id": 6,
       "type": "state-timeline",
       "title": "Per-feed state (supervisor)",
-      "description": "running / restarting / permanently_failed / stopped, from FeedSupervisor.",
+      "description": "running / restarting / permanently_failed / stopped, from FeedSupervisor. Explicit value mappings below (not Grafana's default threshold coloring, which colored the value=1 'currently in this state' row for the *good* running state red and the value=0 'not in this state' rows for every other state green -- a real, confirmed rendering bug, not just a stylistic choice).",
       "gridPos": { "x": 0, "y": 24, "w": 24, "h": 6 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
-        "defaults": {},
-        "overrides": []
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "inactive", "color": "#8E8E8E", "index": 0 },
+                "1": { "text": "active", "color": "#8E8E8E", "index": 1 }
+              }
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/- running$/" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": { "text": "not running", "color": "#8E8E8E", "index": 0 },
+                      "1": { "text": "running", "color": "green", "index": 1 }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/- restarting$/" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": { "text": "not restarting", "color": "#8E8E8E", "index": 0 },
+                      "1": { "text": "restarting", "color": "orange", "index": 1 }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/- stopped$/" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": { "text": "not stopped", "color": "#8E8E8E", "index": 0 },
+                      "1": { "text": "stopped", "color": "#8E8E8E", "index": 1 }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/- permanently_failed$/" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": { "text": "not failed", "color": "#8E8E8E", "index": 0 },
+                      "1": { "text": "PERMANENTLY FAILED", "color": "red", "index": 1 }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
