@@ -535,3 +535,242 @@ for instance) from silently violating. `test_book_engine_has_no_async_methods`
 M3 merely depends on and documents) enforces it mechanically: it fails
 loudly the moment any `BookEngine` method becomes a coroutine function.
 
+## M4 — OKX feed client + normalization layer
+
+### The architecture-validation property, stated and verified
+
+If the exchange-agnostic design from M1-M3 is real, adding a second
+exchange should touch zero lines of `book/`, `connection.py`, or
+`ratelimit.py` — the entire diff should be a new protocol adapter plus a
+thin normalization layer plus tests. Verified with `git diff --stat`
+before every commit in this milestone, not just claimed: every commit
+message in this section states the exact file set touched, and
+`book/`, `connection.py`, `ratelimit.py` show empty diffs across all of
+them. `test_book_engine_has_no_async_methods` (M1, still guarding the
+concurrency argument M3 depends on) passes unmodified throughout.
+
+### `transport.py` extraction as its own commit, before any OKX code
+
+`WebSocketLike`/`WebSocketConnector` lived in `binance.py`, but they're
+generic to any websocket-based feed client -- OKX needs the exact same
+protocols. Importing them from `binance.py` would be backwards coupling
+(OKX depending on Binance's module for a concept that predates both).
+Done as a pure move in its own commit, verified zero behavior change
+(full suite green before and after, `git diff --stat` shows only a
+lift-and-shift), specifically so the refactor is reviewable in isolation
+from the feature work that depends on it -- "refactor, then feature" as
+two separate diffs a reviewer can evaluate independently.
+
+`transport.py` did gain one thing later in this milestone:
+`WebSocketLike.send()`. Binance's client never sends anything
+post-connect (pure consumer of the stream), but OKX must send
+subscribe/unsubscribe/ping -- and a real websocket connection has
+`.send()` regardless of whether Binance's client happens to use it, so
+extending the *shared* protocol (rather than forking an OKX-only
+variant) is the accurate model. Required adding a no-op `send()` to
+Binance's own test fixture (`FakeWebSocket`) to keep satisfying the
+widened protocol -- caught immediately by mypy, not silently.
+
+### Normalization: `InstrumentId` on `TimestampedEvent`
+
+A canonical `(exchange, symbol)` pairing carried on every event, so
+M5's sink sees one schema across feeds instead of inferring which
+exchange an event came from. Deliberately thin: `symbol` stays in each
+exchange's own native format (`"BTCUSDT"` vs `"BTC-USDT"`) -- no
+cross-exchange "these are the same instrument" mapping here, that's
+M5's job, not built early on spec. `binance.py` touched in exactly one
+place (constructing `TimestampedEvent` with
+`InstrumentId("binance", self._symbol)`) -- the one deliberate
+exception to keeping M3 frozen, chosen over an `Optional[InstrumentId]`
+field because a half-tagged event stream would defeat the point of a
+normalization layer.
+
+### Event-driven resync for OKX, not Binance's loop-driven retry
+
+Binance's `_fetch_snapshot()` is request/response: await a REST call,
+get a `SnapshotEvent` back directly, inside a `for attempt in range(...)`
+loop in `_perform_resync()`. OKX's snapshot arrives asynchronously as a
+normal channel push, seen by the *reader loop*, not by whatever sent
+the resubscribe request -- a nested retry loop that "awaits a snapshot"
+doesn't fit that shape. **Request/response protocols get loop-driven
+retries; push protocols get event-driven ones.** `_resync_worker`
+becomes a thin trigger (wait on `resync_needed`, send one rate-limited
+resubscribe, go back to waiting) instead of an owner of the retry
+count; the reader loop owns applying whatever snapshot eventually
+arrives and re-triggers the worker on failure. The outer shape stays
+shared (`run()` owns `ConnectionManager` + a persistent resync worker +
+an inline reader loop, identical incident vocabulary, identical
+`get_stats()` contract) — only the retry *orchestration* differs,
+because that's what actually fits an async-push protocol.
+
+**Retry-counter semantics, explicit and tested:**
+`self._snapshot_retry_count` increments on every failed resync attempt
+(`SNAPSHOT_STALE` or `GAP_DETECTED`-during-replay), resets to 0 on
+`APPLIED` and on every new connection (right after `invalidate()`), and
+forces a full reconnect once it reaches `snapshot_retry_limit`. The
+double reset point (success *and* new-connection) is what guarantees no
+leakage across episodes — a resync storm at hour 3 gets a full fresh
+budget, not whatever was left over from an unrelated storm at hour 1.
+`test_retry_counter_resets_on_success_and_does_not_leak_across_episodes`
+proves this directly: episode 1 needs exactly 3 attempts (2 stale + 1
+valid) to converge, episode 2 (a later, unrelated gap) needs its own
+full 3 attempts to exhaust the limit -- if the counter had leaked,
+episode 2 would exhaust in fewer.
+
+**Bug caught in review before it shipped:** `_request_resubscribe()`
+originally re-read `self._current_ws` across two separate `await`
+points (the unsubscribe send, then the subscribe send). A disconnect
+landing between them (`run()`'s `finally` clearing `self._current_ws`
+to `None`) would crash the second send with `AttributeError` on `None`
+-- silently killing `_resync_worker` for the rest of the process's
+life, since nothing awaits its result. Fixed by capturing the reference
+once into a local and suppressing mid-flight failures (harmless: `run()`'s
+own reconnect handling is already covering the disconnect, and the next
+connection gets a fresh snapshot for free via the normal subscribe flow
+regardless).
+
+**Bug caught by the tests failing, not by review:** 4 of the 6 new
+client tests initially failed identically -- every scenario that
+`ws.enqueue()`d a message *after* `client.run()` was already consuming
+never saw it; `engine.last_applied_id` stayed frozen at whatever the
+cold-start snapshot set. Root cause was in the test fixture, not the
+client: `FakeOKXWebSocket.recv()` did `await asyncio.sleep(3600)` when
+its queue was empty, and Python's `asyncio.sleep` can't be woken early
+-- calling `enqueue()` while `recv()` was already suspended inside that
+sleep just appended to a list nothing was watching. Binance's fixtures
+never hit this because every scripted message was queued *before*
+`client.run()` started; this was the first test that needed to inject a
+message into an already-running client. Fixed by waiting on an
+`asyncio.Event` instead of a fixed sleep, set by `enqueue()`, `send()`'s
+queued responses, and `close()`. Worth keeping as a reminder that a
+fake's own concurrency model needs the same scrutiny as production
+code -- a bug in the harness produces the exact same symptom as a bug
+in the thing it's testing.
+
+### Keepalive: two private `_receive_message()` methods, no shared `Protocol`
+
+Binance's watchdog is one `asyncio.wait_for(ws.recv(), timeout=...)`
+call. OKX's is a two-stage dance (silence → send text `"ping"` → a
+second silence window → dead). Considered a shared `KeepaliveStrategy`
+Protocol both clients would implement; rejected for two exchanges with
+this little actually-shared logic — rule of three, don't abstract for
+two cases. Each client owns a private method with the same name and
+role, zero shared code, called from that client's own reader loop.
+**Revisit this if a third exchange needs a third keepalive shape** —
+that's the concrete trigger for extracting a real abstraction, not a
+hypothetical future-proofing exercise now.
+
+The `"pong"` check happens on the raw string, before any `json.loads`
+call, so a pong can never surface as a false `MALFORMED_MESSAGE` — same
+reasoning as Binance's malformed-message handling, applied one layer
+earlier here because OKX's liveness signal is itself a non-JSON payload.
+
+### Rate limiting: two `TokenBucket` instances, `ratelimit.py` unmodified
+
+Verified against live OKX docs at implementation time (checked
+2026-07-12; changelog confirms the `checksum`-deprecation note is dated
+2026-06-23, cited with that date rather than just "deprecated" since
+API behavior notes like this can go stale): subscribe/unsubscribe/login
+capped at 480/hour per connection; connection *attempts* capped at
+3/sec per IP. Both figures independently confirmed via a live fetch
+against `developers.okx.com`, not recalled from training data.
+
+- **Resubscribe ops**: `capacity=40, refill=480/3600`. This
+  connection's only consumer of the hourly budget beyond the one-time
+  initial subscribe is resubscribe (unsubscribe+subscribe = 2 ops per
+  attempt), so sizing directly against the documented limit needs no
+  further fractioning.
+- **Connection attempts**: `capacity=3, refill=3/sec`, matching the
+  documented per-IP limit directly. Worth having despite
+  `ConnectionManager`'s backoff already making rapid reconnects
+  unlikely in practice — the documented limit is a hard ceiling, not a
+  suggestion, and `base_seconds=0.5` alone doesn't guarantee staying
+  under it in a pathological instant-fail-instant-retry sequence.
+
+Both reuse the exact `TokenBucket` class from M3 with different
+constructor arguments — no modification to `ratelimit.py` (confirmed by
+`git diff --stat` showing it untouched across every M4 commit).
+
+### Service notice routed through the standard reconnect path via a local exception
+
+OKX pushes `{"event":"notice","code":"64008"}` ahead of planned
+maintenance disconnects. Detected in the reader loop, logs
+`OKX_SERVICE_NOTICE`, then raises a local `_ServiceNoticeReconnect` so
+`run()`'s except chain routes it through the *same* `disconnected()` →
+backoff → reconnect path as any other disconnect (mirrors how a
+`TimeoutError` signals a watchdog trip) — but skips logging a redundant
+`WS_DISCONNECTED` for the same event, since the notice already explains
+why. Kept the same jittered backoff rather than an immediate retry:
+if OKX is notifying broadly ahead of planned maintenance, other clients
+are likely reconnecting around the same moment too, and jitter still
+helps even for a "graceful", self-initiated reconnect.
+
+### OKX message-routing decision tree
+
+```
+raw text received
+├─ raw == "pong"?                         -> liveness only, no JSON parse
+├─ json.loads fails?                      -> MALFORMED_MESSAGE, skip
+└─ parsed as JSON:
+   ├─ has "event" key (control-plane)?
+   │  ├─ event in {"subscribe","unsubscribe"} -> ack, DEBUG log
+   │  ├─ event == "notice", code == "64008"    -> OKX_SERVICE_NOTICE, proactive reconnect
+   │  ├─ event == "error"                      -> OKX_SUBSCRIBE_ERROR (WARNING)
+   │  └─ unrecognized event                    -> MALFORMED_MESSAGE (defensive)
+   └─ has "arg"/"action"/"data" (channel push)?
+      ├─ action == "snapshot" -> parse_book_snapshot() -> engine.load_snapshot()
+      ├─ action == "update"   -> parse_book_update()   -> engine.apply_event()
+      └─ unrecognized/malformed -> MALFORMED_MESSAGE
+```
+
+### What live OKX verification found that the milestone spec didn't anticipate
+
+Connected directly to `wss://ws.okx.com:8443/ws/v5/public` and captured
+real `books`-channel traffic rather than writing a parser from docs/
+memory (same standard as the Binance fixtures, provenance notes in
+`tests/fixtures/okx/README.md`):
+
+- **Not in the original spec**: OKX price levels are 4-element
+  `[price, qty, deprecated, numOrders]`, not Binance's 2-element
+  `[price, qty]`. A parser written from memory of the docs alone could
+  easily assume the Binance shape and silently index the wrong field.
+  Pinned with its own named regression test (U7), not just incidental
+  coverage inside the normal-update parsing test.
+- **Specifically verified per the spec's request**: `prevSeqId == -1`
+  on the snapshot message — confirmed live, a sentinel, not a real
+  predecessor. Confirmed irrelevant too: `SnapshotEvent` has no
+  `prev_id` field, so the sentinel is never consumed regardless of its
+  value.
+- **Could not verify, said so rather than guessing**: "equal seqId on
+  no-change pushes" for the incremental `books` channel specifically
+  (found this documented for the snapshot-style `books5`/`bbo-tbt`
+  channels, not `books`). Noted instead that the generic chaining check
+  handles this correctly by construction even if it occurs — a message
+  where `final_id == prev_id` still passes `prev_id == last_applied_id`
+  and just re-sets the checkpoint to the same value, no special-casing
+  needed either way.
+- **Confirmed, not just trusted from the milestone spec**: the 480/hour
+  and 3/sec rate limits, and the text `"ping"`/`"pong"` keepalive
+  recipe, all independently re-verified against live docs rather than
+  taken as given.
+
+### Binance vs OKX: protocol differences and where each is absorbed
+
+| Concern | Binance | OKX | Absorbed in |
+|---|---|---|---|
+| Snapshot delivery | Separate REST call | First WS push after subscribe | Feed client (`_fetch_snapshot` vs automatic) |
+| Resync trigger | Direct REST re-fetch | Unsubscribe + resubscribe | Feed client (`_perform_resync` vs `_request_resubscribe`) |
+| Resync orchestration | Loop-driven (`for` + retry count) | Event-driven (`resync_needed` + reader-loop-owned) | Feed client control flow |
+| Sequence fields | `U`/`u`, `prev_id = U-1` | `seqId`/`prevSeqId`, direct mapping | Feed client parsing layer only |
+| Sequence chaining semantics | Contiguous partition (`+1`) | Chain-by-equality (`prevSeqId == prior seqId`) | `BookEngine`'s generic `prev_id`/`final_id` contract absorbs both without knowing which |
+| Price level shape | `[price, qty]` (2-element) | `[price, qty, deprecated, numOrders]` (4-element) | Feed client parsing layer only |
+| Keepalive | Protocol-level ping/pong (library) + message-based watchdog | Application-level text `"ping"`/`"pong"`, two-stage | Feed client `_receive_message`, no shared abstraction |
+| Rate limiting | REST weight budget (6000/min) | Connection (3/sec) + op budget (480/hour) | Two `TokenBucket` instances per client, same class |
+| Integrity field | N/A | `checksum` deprecated (fixed to 0), `seqId`/`prevSeqId` is official | Never referenced in either parser |
+| Planned-maintenance signal | None | `{"event":"notice","code":"64008"}` | OKX reader loop only, routed through standard reconnect |
+
+Every row on the OKX side lives in `okx.py`; every row on the Binance
+side lives in `binance.py` (or was already there since M3); `book/`,
+`connection.py`, `ratelimit.py` appear in neither column, by design and
+by `git diff --stat`.
+
