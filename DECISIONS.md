@@ -980,3 +980,188 @@ this milestone's automated suite proves the pipeline's *logic*, not that
 it survives real network conditions unattended for an hour, which no
 unit test can honestly claim.
 
+## M6 — Prometheus metrics + Grafana dashboard
+
+### Two latency concepts, never conflated
+
+`l2_processing_latency_seconds` (Histogram) and `l2_feed_lag_seconds`
+(Gauge) measure genuinely different things and are never allowed to blur
+into each other, in code or in the dashboard:
+
+- **Processing latency** is `monotonic_ns` at frame receipt (the existing
+  `ts_local_ns` capture point) to `monotonic_ns` immediately after
+  `apply_event()` returns `APPLIED`. One clock, no cross-machine
+  comparison — this is an honestly precise measurement of how long this
+  process took to fold an update into the book. It's what the README's
+  p50/p95/p99 figures come from.
+- **Feed lag** is wall-clock `time.time()` now minus the exchange's own
+  event timestamp (Binance's `E`, OKX's `ts`). Two different clocks on two
+  different machines — this number is only ever as good as clock sync
+  between here and the exchange, which is unverified and unverifiable
+  from this side. The Gauge's own `HELP` text says so verbatim
+  ("approximate; compares exchange timestamp against local wall clock;
+  subject to clock skew"), not just a code comment — the honesty has to
+  survive all the way to whoever reads the dashboard, not just whoever
+  reads the source.
+
+The interview answer for "so what latency did you actually measure?" is
+this distinction stated plainly: one number is a precise, single-clock
+measurement of this process's own cost; the other is a cross-clock,
+approximate operational signal (rising lag + flat processing latency
+means the problem is upstream, not here) — and the code and the exposed
+metric names make it impossible to accidentally quote one as the other.
+
+Both are observed at exactly one call site per client (the steady-state
+diff-apply branch in `_reader_loop`/`_handle_update_push`) and
+deliberately *not* at resync completion — a resync involves a network
+round-trip to fetch a snapshot, an entirely different, much larger
+latency shape that would pollute a histogram whose buckets are tuned for
+in-process dict mutation. Fewer call sites also means fewer places that
+could drift out of sync with each other over time.
+
+### `PipelineCollector`: read `get_stats()` at scrape time, don't double-instrument
+
+The single instrumentation rule for this milestone: **counters that
+`get_stats()` already tracks get read at scrape time by a custom
+`prometheus_client.registry.Collector`, never incremented a second time
+by a `prometheus_client.Counter` sitting next to the existing one.**
+Two increment sites for the same fact is exactly the kind of drift that
+produces a dashboard quietly disagreeing with the logs during an
+incident — and M5's `get_stats()` was already the established single
+source of truth for every feed client, the sink, and the supervisor, so
+respecting that boundary rather than re-deriving it from scratch was the
+only defensible choice.
+
+The only thing that *can't* be reconstructed after the fact is a
+per-event histogram observation — there's no `get_stats()` counter that
+tells you the shape of a latency distribution after the fact, only its
+count. That's the one and only exception: `Histogram.observe()` and
+`Gauge.set()` for the two latency metrics happen directly in the feed
+clients' hot path, at the single call site described above, nowhere else.
+Interview framing: instrumentation belongs at the scrape boundary by
+default; it only moves into the hot path when the data genuinely can't
+survive until scrape time, and even then it should cost as little as
+possible there (see below).
+
+`PipelineCollector` deliberately does **not** expose every key
+`get_stats()` happens to carry — each metric it produces is named and
+fixed (`l2_messages_received_total`, `l2_gaps_detected_total`,
+`l2_ws_reconnects_total`, `l2_watchdog_trips_total`,
+`l2_resyncs_completed_total`, `l2_feed_restarts_total`, plus the
+unlabeled sink counters/gauge), matching exactly what the dashboard
+needs. A generic "expose every counter key as a label value" passthrough
+was considered and rejected: it would let cardinality grow silently every
+time a future incident counter gets added to a feed client, which
+contradicts the fixed-and-small cardinality promise below. The cost is
+that a new incident type needing its own panel requires a
+`metrics.py` change too — an acceptable, explicit tradeoff.
+
+### Cardinality: `exchange`/`symbol` plus one closed enum, nothing dynamic
+
+Every per-feed metric is labeled by exactly `exchange` and `symbol`,
+both drawn from config, both fixed at process startup — never a
+user-controlled or unbounded value. `l2_feed_state` adds one more label,
+but its four possible values are `FeedSupervisor.FeedState`'s own closed
+Python enum, not open-ended, using `StateSetMetricFamily`'s "one series
+per possible state, 1 for current, 0 for the rest" pattern (the standard
+Prometheus state-set idiom, e.g. `l2_feed_state{exchange="binance",
+symbol="BTCUSDT", l2_feed_state="running"} 1`). M6-3 pins this literally:
+build a real `PipelineCollector` plus the two hot-path metrics, observe
+for exactly the two configured `(exchange, symbol)` pairs, then scan
+*every* sample this collector and both metrics produce and assert the
+full set of `(exchange, symbol)` pairs found equals exactly the
+configured set — nothing more, nothing fewer.
+
+### Histogram buckets: log-spaced, 50us-100ms, 1-2-5 per decade
+
+```python
+buckets=(0.00005, 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005,
+         0.01, 0.02, 0.05, 0.1)
+```
+
+Processing latency here is dominated by in-process dict mutation
+(`apply_levels`) and event-loop scheduling overhead, not I/O — mass is
+expected in the tens-of-microseconds range with a tail into low
+milliseconds under GC pauses or scheduling jitter. Log spacing gives even
+relative resolution across that span instead of concentrating precision
+in one order of magnitude that may not even be where the interesting
+behavior lives. `0.1` (100ms) is a deliberately generous "something is
+badly wrong" ceiling — everything worse collapses into the automatic
+`+Inf` bucket, which is fine, since the goal at that point is detecting a
+bad tail exists, not characterizing its exact shape. Explicitly a first
+guess: retunable once A4's live run shows the real distribution.
+
+### Hot-path cost: `Histogram.observe()`/`Gauge.set()` are two float ops, not I/O
+
+Both calls are pure in-process Python/C: `observe()` walks the fixed
+11-bucket array (a linear scan, negligible at this size) and increments
+a couple of atomic counters; `set()` is a single assignment under a lock
+internal to the `Gauge`. Neither touches the network, the filesystem, or
+`asyncio` in any way — no `await`, no scheduling, no lock shared with
+anything else in the reader loop. At Binance/OKX's real message rates
+(low hundreds/sec per feed, not millions), this is immeasurably small
+next to the JSON parsing and dict mutation already happening on the same
+code path. No benchmark was run to produce a number here — M7's job, not
+M6's — but the *reason* it's negligible is structural (no I/O, no lock
+contention, fixed small bucket count), not an assumption resting on a
+number nobody measured.
+
+### Grafana as code: one `docker compose up`, zero manual clicking
+
+`ops/docker-compose.yml` runs Prometheus + Grafana only — the app itself
+runs on the host, not in the compose stack, so Prometheus reaches it via
+`host.docker.internal:9100` (the documented route from a container to a
+host-published port on Docker Desktop). An `extra_hosts:
+host.docker.internal:host-gateway` entry is included so the same compose
+file also resolves that hostname on plain Docker Engine (e.g. Linux CI),
+even though the primary target is Docker Desktop on Windows per the
+user's environment — no host-networking mode, no Linux-only assumptions,
+explicit port mappings only (`9090` Prometheus, `3000` Grafana).
+
+Grafana's datasource (pinned `uid: prometheus`, pointed at
+`http://prometheus:9090` — compose's own DNS resolves the service name)
+and the dashboard JSON are both auto-provisioned from files under
+`ops/grafana/provisioning/`, committed and versioned like any other
+config — no manual "add a datasource" or "import a dashboard" click
+required after `docker compose up`. The dashboard itself
+(`ops/grafana/dashboards/l2-pipeline.json`) is one screen, six panels:
+processing latency p50/p95/p99, feed lag, messages/sec, incidents/sec
+(reconnects/gaps/resyncs/watchdog trips), sink health (rows
+written/dropped per sec + queue depth), and a state-timeline panel for
+per-feed supervisor state.
+
+**Verified, not just written**: `docker compose config` (structure/mount/
+port validation, doesn't need the daemon) passes cleanly; every YAML file
+parses; the dashboard JSON parses. A genuine live `docker compose up`
+boot was **not** performed in this session — Docker Desktop's daemon
+wasn't running in this environment, and starting it unprompted was out of
+scope. That live verification, plus the real-traffic screenshot, is
+exactly what A4 is for.
+
+### Test evidence
+
+`tests/unit/test_metrics.py`, 4 tests (M6-1 through M6-4): Collector
+correctness (fake stats providers with known counter values -> `
+generate_latest()` output parsed back and checked sample-by-sample
+against expected values and labels), Histogram observation (six synthetic
+durations spanning below the smallest bucket through beyond the largest
+-> exact bucket counts, `_sum`, `_count` all checked), the cardinality
+guard described above, and a real ephemeral-port server spin-up/scrape/
+clean-shutdown round trip (`port=0`, read back `server.server_port`,
+`urllib.request.urlopen` the real HTTP response, parse it as Prometheus
+text, then `shutdown()`/`server_close()`/`thread.join()` and assert the
+thread actually exited). Full suite: 91 tests (87 at the end of M5 + 4
+new), `mypy --strict` clean across 40 source files, `ruff` clean.
+
+### Heartbeats and metrics stay both, on purpose
+
+M5's per-connection heartbeat log line and the pipeline-wide heartbeat
+log line are both untouched by this milestone, and metrics don't replace
+either. They serve different audiences and different failure modes:
+structured logs are for incident forensics after the fact (grep a
+specific `WATCHDOG_TRIPPED` at a specific timestamp, reconstruct exactly
+what a single connection did), metrics/dashboards are for noticing a
+trend or an anomaly *while it's happening*, at a glance, without reading
+log lines at all. Removing either in favor of the other would trade away
+one of those two, for no benefit.
+
