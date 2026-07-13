@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -67,7 +68,9 @@ async def test_p6_simulation_row_matches_oracle_top_n(tmp_path: Path) -> None:
     row = build_snapshot_row(
         engine,
         InstrumentId("sim", "TESTUSD"),
-        ts_local_ns=123_000_000_000,
+        ts_local_ns=123_000_000_000,  # monotonic-shaped -- deliberately NOT epoch-like, to
+        # prove partitioning genuinely uses ts_wall_ns and not this field (see DECISIONS.md M7)
+        ts_wall_ns=time.time_ns(),
         ts_exchange_ms=None,
     )
     queue = BoundedRowQueue(maxsize=10)
@@ -90,7 +93,13 @@ async def test_p6_simulation_row_matches_oracle_top_n(tmp_path: Path) -> None:
 
     files = sorted(tmp_path.rglob("part-*.parquet"))
     assert len(files) == 1
-    table = pq.read_table(str(files[0]))
+
+    # Read via the directory (default partitioning='hive'), not the single
+    # file directly -- exercises the same fix as
+    # test_p2_multi_partition_tree_reads_back_via_default_hive_reader:
+    # exchange/symbol are reconstructed from the Hive path, not read as
+    # in-file columns (see build_schema(), DECISIONS.md M7).
+    table = pq.read_table(str(tmp_path))
     assert table.num_rows == 1
 
     expected_bids, expected_asks = _oracle_top_n(market, depth_levels)

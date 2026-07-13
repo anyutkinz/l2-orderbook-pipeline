@@ -1,0 +1,617 @@
+{
+  "run_metadata": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 140 Stepping 2, GenuineIntel",
+    "python_version": "3.12.0",
+    "cpu_count": "8",
+    "seed": 9001,
+    "fault_config": "storm",
+    "depth_levels": 20,
+    "queue_maxsize": 10000,
+    "duration_seconds": 20.0,
+    "rates": [
+      500,
+      1000,
+      2000,
+      4000,
+      8000,
+      16000,
+      32000
+    ],
+    "num_feeds": [
+      2,
+      1
+    ],
+    "latency_ceiling_seconds": 0.1
+  },
+  "sweep": [
+    {
+      "num_feeds": 2,
+      "target_rate": 500,
+      "achieved_rate": 999.7,
+      "duration_seconds": 20.0,
+      "rows_dropped": 0,
+      "max_queue_depth": 2,
+      "rows_written": 13983,
+      "processing_latency_p50": 2.5037602062741727e-05,
+      "processing_latency_p95": 4.757144391920928e-05,
+      "processing_latency_p99": 4.9574452084228624e-05,
+      "processing_latency_p999": 0.013341428571428489,
+      "sample_count": 13983,
+      "fault_summary": {
+        "drop_one": [
+          847,
+          25
+        ],
+        "drop_burst": [
+          494,
+          3
+        ],
+        "duplicate": [
+          617,
+          61
+        ],
+        "reorder": [
+          596,
+          75
+        ],
+        "disconnect": [
+          178,
+          0
+        ],
+        "delayed_snapshot": [
+          2119,
+          0
+        ]
+      },
+      "recoveries": 2497,
+      "breach": ""
+    },
+    {
+      "num_feeds": 2,
+      "target_rate": 1000,
+      "achieved_rate": 1998.4011991109032,
+      "duration_seconds": 20.014999999897555,
+      "rows_dropped": 0,
+      "max_queue_depth": 2,
+      "rows_written": 27833,
+      "processing_latency_p50": 2.5032377594704466e-05,
+      "processing_latency_p95": 4.756151742993848e-05,
+      "processing_latency_p99": 4.956410763751484e-05,
+      "processing_latency_p999": 0.012268611111111468,
+      "sample_count": 27833,
+      "fault_summary": {
+        "drop_one": [
+          1654,
+          65
+        ],
+        "drop_burst": [
+          1014,
+          7
+        ],
+        "duplicate": [
+          1259,
+          113
+        ],
+        "reorder": [
+          1190,
+          165
+        ],
+        "disconnect": [
+          351,
+          0
+        ],
+        "delayed_snapshot": [
+          4256,
+          0
+        ]
+      },
+      "recoveries": 5020,
+      "breach": ""
+    },
+    {
+      "num_feeds": 2,
+      "target_rate": 2000,
+      "achieved_rate": 3997.002398115754,
+      "duration_seconds": 20.015999999828637,
+      "rows_dropped": 0,
+      "max_queue_depth": 2,
+      "rows_written": 55708,
+      "processing_latency_p50": 2.503145332326827e-05,
+      "processing_latency_p95": 4.7559761314209716e-05,
+      "processing_latency_p99": 4.9562277580071176e-05,
+      "processing_latency_p999": 0.012041714285714468,
+      "sample_count": 55708,
+      "fault_summary": {
+        "drop_one": [
+          3314,
+          141
+        ],
+        "drop_burst": [
+          2067,
+          15
+        ],
+        "duplicate": [
+          2515,
+          238
+        ],
+        "reorder": [
+          2440,
+          349
+        ],
+        "disconnect": [
+          697,
+          0
+        ],
+        "delayed_snapshot": [
+          8621,
+          0
+        ]
+      },
+      "recoveries": 10125,
+      "breach": ""
+    },
+    {
+      "num_feeds": 2,
+      "target_rate": 4000,
+      "achieved_rate": 7989.6083134177225,
+      "duration_seconds": 20.015999999828637,
+      "rows_dropped": 0,
+      "max_queue_depth": 2,
+      "rows_written": 111001,
+      "processing_latency_p50": 2.5038572588649285e-05,
+      "processing_latency_p95": 4.757328791843364e-05,
+      "processing_latency_p99": 4.9576373725525584e-05,
+      "processing_latency_p999": 0.013529352941176246,
+      "sample_count": 111001,
+      "fault_summary": {
+        "drop_one": [
+          6608,
+          291
+        ],
+        "drop_burst": [
+          4152,
+          38
+        ],
+        "duplicate": [
+          5095,
+          470
+        ],
+        "reorder": [
+          4851,
+          696
+        ],
+        "disconnect": [
+          1410,
+          0
+        ],
+        "delayed_snapshot": [
+          17338,
+          0
+        ]
+      },
+      "recoveries": 20227,
+      "breach": ""
+    },
+    {
+      "num_feeds": 2,
+      "target_rate": 8000,
+      "achieved_rate": 11709.0,
+      "duration_seconds": 20.0,
+      "rows_dropped": 0,
+      "max_queue_depth": 2,
+      "rows_written": 162933,
+      "processing_latency_p50": 2.50445761575967e-05,
+      "processing_latency_p95": 4.758469469943374e-05,
+      "processing_latency_p99": 4.9588260792041466e-05,
+      "processing_latency_p999": 0.014521957295374022,
+      "sample_count": 162933,
+      "fault_summary": {
+        "drop_one": [
+          9665,
+          414
+        ],
+        "drop_burst": [
+          6090,
+          55
+        ],
+        "duplicate": [
+          7429,
+          690
+        ],
+        "reorder": [
+          7111,
+          1031
+        ],
+        "disconnect": [
+          2040,
+          0
+        ],
+        "delayed_snapshot": [
+          25406,
+          0
+        ]
+      },
+      "recoveries": 29542,
+      "breach": ""
+    },
+    {
+      "num_feeds": 2,
+      "target_rate": 16000,
+      "achieved_rate": 11696.277791716124,
+      "duration_seconds": 20.014999999897555,
+      "rows_dropped": 0,
+      "max_queue_depth": 2,
+      "rows_written": 162878,
+      "processing_latency_p50": 2.5040278939341766e-05,
+      "processing_latency_p95": 4.757652998474935e-05,
+      "processing_latency_p99": 4.9579752299896695e-05,
+      "processing_latency_p999": 0.01390244094488201,
+      "sample_count": 162878,
+      "fault_summary": {
+        "drop_one": [
+          9660,
+          414
+        ],
+        "drop_burst": [
+          6086,
+          55
+        ],
+        "duplicate": [
+          7428,
+          689
+        ],
+        "reorder": [
+          7110,
+          1030
+        ],
+        "disconnect": [
+          2040,
+          0
+        ],
+        "delayed_snapshot": [
+          25396,
+          0
+        ]
+      },
+      "recoveries": 29531,
+      "breach": ""
+    },
+    {
+      "num_feeds": 2,
+      "target_rate": 32000,
+      "achieved_rate": 11665.317745903229,
+      "duration_seconds": 20.015999999828637,
+      "rows_dropped": 0,
+      "max_queue_depth": 2,
+      "rows_written": 162433,
+      "processing_latency_p50": 2.5044250243607614e-05,
+      "processing_latency_p95": 4.758407546285447e-05,
+      "processing_latency_p99": 4.958761548234308e-05,
+      "processing_latency_p999": 0.014432989323843773,
+      "sample_count": 162433,
+      "fault_summary": {
+        "drop_one": [
+          9631,
+          414
+        ],
+        "drop_burst": [
+          6075,
+          55
+        ],
+        "duplicate": [
+          7408,
+          688
+        ],
+        "reorder": [
+          7093,
+          1028
+        ],
+        "disconnect": [
+          2037,
+          0
+        ],
+        "delayed_snapshot": [
+          25328,
+          0
+        ]
+      },
+      "recoveries": 29460,
+      "breach": ""
+    },
+    {
+      "num_feeds": 1,
+      "target_rate": 500,
+      "achieved_rate": 499.45043965255735,
+      "duration_seconds": 20.015999999828637,
+      "rows_dropped": 0,
+      "max_queue_depth": 1,
+      "rows_written": 7047,
+      "processing_latency_p50": 2.5021303792074992e-05,
+      "processing_latency_p95": 4.754047720494248e-05,
+      "processing_latency_p99": 4.954218150830848e-05,
+      "processing_latency_p999": 4.9992564976565835e-05,
+      "sample_count": 7047,
+      "fault_summary": {
+        "drop_one": [
+          451,
+          16
+        ],
+        "drop_burst": [
+          238,
+          0
+        ],
+        "duplicate": [
+          301,
+          25
+        ],
+        "reorder": [
+          278,
+          39
+        ],
+        "disconnect": [
+          90,
+          0
+        ],
+        "delayed_snapshot": [
+          1017,
+          0
+        ]
+      },
+      "recoveries": 1240,
+      "breach": ""
+    },
+    {
+      "num_feeds": 1,
+      "target_rate": 1000,
+      "achieved_rate": 999.55,
+      "duration_seconds": 20.0,
+      "rows_dropped": 0,
+      "max_queue_depth": 1,
+      "rows_written": 13875,
+      "processing_latency_p50": 2.502164033758927e-05,
+      "processing_latency_p95": 4.754111664141961e-05,
+      "processing_latency_p99": 4.954284786842675e-05,
+      "processing_latency_p999": 4.9993237394503355e-05,
+      "sample_count": 13875,
+      "fault_summary": {
+        "drop_one": [
+          830,
+          36
+        ],
+        "drop_burst": [
+          491,
+          2
+        ],
+        "duplicate": [
+          620,
+          55
+        ],
+        "reorder": [
+          584,
+          77
+        ],
+        "disconnect": [
+          188,
+          0
+        ],
+        "delayed_snapshot": [
+          2061,
+          0
+        ]
+      },
+      "recoveries": 2496,
+      "breach": ""
+    },
+    {
+      "num_feeds": 1,
+      "target_rate": 2000,
+      "achieved_rate": 1998.4,
+      "duration_seconds": 20.0,
+      "rows_dropped": 0,
+      "max_queue_depth": 1,
+      "rows_written": 27752,
+      "processing_latency_p50": 2.502615157089781e-05,
+      "processing_latency_p95": 4.7549687984705834e-05,
+      "processing_latency_p99": 4.9551780110377664e-05,
+      "processing_latency_p999": 0.01044571428571414,
+      "sample_count": 27752,
+      "fault_summary": {
+        "drop_one": [
+          1655,
+          70
+        ],
+        "drop_burst": [
+          1023,
+          5
+        ],
+        "duplicate": [
+          1248,
+          106
+        ],
+        "reorder": [
+          1214,
+          168
+        ],
+        "disconnect": [
+          365,
+          0
+        ],
+        "delayed_snapshot": [
+          4272,
+          0
+        ]
+      },
+      "recoveries": 5051,
+      "breach": ""
+    },
+    {
+      "num_feeds": 1,
+      "target_rate": 4000,
+      "achieved_rate": 3992.0059955238053,
+      "duration_seconds": 20.014999999897555,
+      "rows_dropped": 0,
+      "max_queue_depth": 1,
+      "rows_written": 55443,
+      "processing_latency_p50": 2.5023017764298097e-05,
+      "processing_latency_p95": 4.754373375216638e-05,
+      "processing_latency_p99": 4.9545575173310226e-05,
+      "processing_latency_p999": 4.99959894930676e-05,
+      "sample_count": 55443,
+      "fault_summary": {
+        "drop_one": [
+          3292,
+          130
+        ],
+        "drop_burst": [
+          2027,
+          17
+        ],
+        "duplicate": [
+          2546,
+          212
+        ],
+        "reorder": [
+          2418,
+          350
+        ],
+        "disconnect": [
+          732,
+          0
+        ],
+        "delayed_snapshot": [
+          8580,
+          0
+        ]
+      },
+      "recoveries": 10101,
+      "breach": ""
+    },
+    {
+      "num_feeds": 1,
+      "target_rate": 8000,
+      "achieved_rate": 7975.868098873848,
+      "duration_seconds": 20.015000000130385,
+      "rows_dropped": 0,
+      "max_queue_depth": 1,
+      "rows_written": 111085,
+      "processing_latency_p50": 2.5037188965019838e-05,
+      "processing_latency_p95": 4.757065903353768e-05,
+      "processing_latency_p99": 4.957363415073927e-05,
+      "processing_latency_p999": 0.013369687499999599,
+      "sample_count": 111085,
+      "fault_summary": {
+        "drop_one": [
+          6611,
+          268
+        ],
+        "drop_burst": [
+          4066,
+          30
+        ],
+        "duplicate": [
+          5111,
+          464
+        ],
+        "reorder": [
+          4838,
+          698
+        ],
+        "disconnect": [
+          1427,
+          0
+        ],
+        "delayed_snapshot": [
+          17392,
+          0
+        ]
+      },
+      "recoveries": 20158,
+      "breach": ""
+    },
+    {
+      "num_feeds": 1,
+      "target_rate": 16000,
+      "achieved_rate": 11370.6,
+      "duration_seconds": 20.0,
+      "rows_dropped": 0,
+      "max_queue_depth": 1,
+      "rows_written": 158533,
+      "processing_latency_p50": 2.504265052475942e-05,
+      "processing_latency_p95": 4.75810359970429e-05,
+      "processing_latency_p99": 4.958444803902366e-05,
+      "processing_latency_p999": 0.01428719230769247,
+      "sample_count": 158533,
+      "fault_summary": {
+        "drop_one": [
+          9426,
+          373
+        ],
+        "drop_burst": [
+          5781,
+          50
+        ],
+        "duplicate": [
+          7307,
+          669
+        ],
+        "reorder": [
+          6914,
+          995
+        ],
+        "disconnect": [
+          2010,
+          0
+        ],
+        "delayed_snapshot": [
+          24763,
+          0
+        ]
+      },
+      "recoveries": 28702,
+      "breach": ""
+    },
+    {
+      "num_feeds": 1,
+      "target_rate": 32000,
+      "achieved_rate": 11222.871702603425,
+      "duration_seconds": 20.016000000061467,
+      "rows_dropped": 0,
+      "max_queue_depth": 1,
+      "rows_written": 156643,
+      "processing_latency_p50": 2.5047170414715894e-05,
+      "processing_latency_p95": 4.75896237879602e-05,
+      "processing_latency_p99": 4.959339742113747e-05,
+      "processing_latency_p999": 0.014820801393727842,
+      "sample_count": 156643,
+      "fault_summary": {
+        "drop_one": [
+          9311,
+          367
+        ],
+        "drop_burst": [
+          5706,
+          50
+        ],
+        "duplicate": [
+          7220,
+          660
+        ],
+        "reorder": [
+          6809,
+          981
+        ],
+        "disconnect": [
+          1987,
+          0
+        ],
+        "delayed_snapshot": [
+          24452,
+          0
+        ]
+      },
+      "recoveries": 28345,
+      "breach": ""
+    }
+  ]
+}

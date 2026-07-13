@@ -1165,3 +1165,110 @@ trend or an anomaly *while it's happening*, at a glance, without reading
 log lines at all. Removing either in favor of the other would trade away
 one of those two, for no benefit.
 
+## M7 — Benchmark report, stress test, README
+
+### Bug found by hands-on verification: exchange/symbol as both a Hive partition key and an in-file column
+
+This is the third real bug this project's own verification discipline has
+caught (after M1's off-by-one, caught by its own test suite, and M2's
+Hypothesis-found `delayed_snapshot_prob` edge case) — and notably, the
+first one caught specifically by *manual* live-data verification (the
+user's own A3/A4 pandas check) rather than an automated test, which is
+exactly why that manual step was kept in the process instead of trusting
+92 passing tests alone.
+
+**Symptom**: `pandas.read_parquet("./data")` against a real ~30-minute
+dual-feed run failed with
+`pyarrow.lib.ArrowTypeError: Unable to merge: Field exchange has
+incompatible types: string vs dictionary<values=string, indices=int32,
+ordered=0>` — not old-vs-new schema drift (the run postdated the
+`ts_wall_ns`/`schema_version=2` fix), a real correctness bug in current
+code.
+
+**Root cause, confirmed by direct reproduction**, not guessed: `exchange`
+and `symbol` were stored *twice* — once as Hive partition-directory
+segments (`exchange=binance/symbol=BTCUSDT/...`, required for the
+partitioned layout) and once more as plain-`string` columns inside every
+Parquet file (`build_schema()`'s original `exchange`/`symbol` fields).
+`pyarrow.parquet.read_table()` and `pandas.read_parquet()` both default to
+`partitioning='hive'` — confirmed directly from their signatures, not
+assumed — meaning they *always* reconstruct partition-key columns from
+the directory path as `dictionary<values=string, indices=int32>`
+columns. Reading more than one partition together therefore always tries
+to merge two genuinely different representations of the same column name:
+the in-file `string` version and the path-inferred `dictionary` version.
+A single-partition read never exercises the merge, which is why this
+wasn't caught by any of the earlier single-file-scoped tests (P1, P2, P6
+before this fix all read back only one file at a time). Reproduced
+directly with a two-line repro (write two small partitions, call
+`pq.read_table()` on the parent directory) before touching any fix code,
+and confirmed the *opposite* case (no in-file `exchange`/`symbol`
+columns) reads back cleanly with the same default call.
+
+**Fix**: `build_schema()` no longer includes `exchange`/`symbol` as
+in-file columns at all — they exist only as Hive partition keys, which is
+also standard Hive/Spark/Trino/DuckDB convention (never duplicate a
+partition column inside the file); the original design's redundancy was
+the actual non-standard choice, not the fix. `SnapshotRow` (the in-memory
+dataclass) keeps both fields unchanged, since `ParquetSink`/
+`_RotatingWriter` still need them to group rows and build each file's
+partition path — only the *on-disk Arrow schema* dropped them.
+`SCHEMA_VERSION` bumped `2 -> 3`.
+
+**Regression test** (`test_p2_multi_partition_tree_reads_back_via_default_hive_reader`):
+writes across two exchanges *and* two file rotations (both conditions are
+required to reproduce it — confirmed empirically that a single partition
+or a single file never triggers the merge), then calls the exact
+previously-failing `pq.read_table(dir)` and asserts it succeeds with
+correct data. P1 and P6 also updated: P1 now asserts `exchange`/`symbol`
+are absent from the in-file schema (asserting the fix, not just avoiding
+breakage); P6 now reads via the directory (exercising real Hive
+reconstruction) instead of a single file.
+
+**Data implication, stated directly**: schema_version=2 files (with the
+in-file columns) and schema_version=3 files (without) cannot be safely
+mixed in the same tree — combining them reintroduces essentially the same
+class of merge inconsistency, just between two different in-file
+representations across files instead of one in-file vs one path-inferred.
+Any existing collected data must be purged before recollecting under the
+fixed schema; there is no in-place migration path that's worth building
+for a portfolio project's dev-machine data.
+
+### Bug found by the stress test itself: `ts_local_ns` (monotonic) fed to Parquet date/hour partitioning
+
+A second real bug, found by M7's own stress-replay smoke test before any
+sweep numbers were trusted: `_hour_key_for()` interpreted
+`SnapshotRow.ts_local_ns` as epoch nanoseconds, but `ts_local_ns` is
+`time.monotonic_ns()` (M3's deliberate, correct choice for latency
+measurement — immune to NTP adjustments, guaranteed non-decreasing), with
+an undefined, non-epoch reference point. On this machine that reference
+point sits near system boot, so every partition date/hour this pipeline
+had ever produced -- M5 onward, including any real Binance/OKX run --
+was silently wrong (`date=1970-01-19` instead of the real date), with no
+error raised, since a monotonic value reinterpreted as epoch time is
+still a valid-looking number.
+
+Confirmed directly (`datetime.fromtimestamp(time.monotonic_ns() / 1e9)`
+prints a 1970 date on this machine) before touching any code. Fixed by
+adding `ts_wall_ns` (`time.time_ns()`, captured back-to-back with the
+existing `ts_local_ns` capture at every reader-loop receipt point and
+resync-completion point) as a genuinely separate field on
+`TimestampedEvent`/`SnapshotRow`, used exclusively for partitioning;
+`ts_local_ns` keeps its original, correct, latency-only role and is never
+again asked to behave like a timestamp. `SCHEMA_VERSION` bumped `1 -> 2`
+for this (then `2 -> 3` for the bug above). Regression test
+(`test_p2_partitioning_uses_ts_wall_ns_not_ts_local_ns`) pins the exact
+failure mode: a monotonic-shaped, deliberately non-epoch `ts_local_ns`
+alongside a real `ts_wall_ns`, asserting the output lands under the real
+date and specifically not under `date=1970*`.
+
+Both bugs share a root cause worth naming explicitly: a field being
+technically well-typed (an `int`, a `str`) said nothing about whether it
+was being used for the *purpose* its value actually represented. Neither
+mypy nor the existing test suite could catch either one, because both
+were semantically wrong in a way indistinguishable from correct at the
+type level -- only running the real code against real multi-partition,
+real-clock conditions surfaced them. This is the concrete argument for
+why A3/A4-style manual verification stays a required part of the process
+even at 91+ passing tests, not a formality.
+

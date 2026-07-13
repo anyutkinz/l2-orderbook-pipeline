@@ -19,6 +19,7 @@ dev = [
     "ruff>=0.6",
     "types-PyYAML>=6.0",
     "hypothesis>=6.156.6",
+    "py-spy>=0.4.2",
 ]
 
 [build-system]
@@ -38,7 +39,7 @@ asyncio_mode = "auto"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 
 [[tool.mypy.overrides]]
 # pyarrow ships no type stubs / py.typed marker -- no official stub

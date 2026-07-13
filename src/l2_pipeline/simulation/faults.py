@@ -31,6 +31,23 @@ class FaultConfig:
     delayed_snapshot_max_steps: int = 5
 
 
+# The "fault storm" scenario: every fault type active at once, at
+# realistic-but-nonzero probabilities. Canonical home for this config so
+# M2's S8 convergence test and M7's stress test both exercise the exact
+# same scenario, not two independently-typed copies that could drift.
+STORM_FAULT_CONFIG = FaultConfig(
+    drop_one_prob=0.05,
+    drop_burst_prob=0.03,
+    drop_burst_max_len=4,
+    duplicate_prob=0.04,
+    reorder_prob=0.04,
+    disconnect_prob=0.01,
+    disconnect_max_len=15,
+    delayed_snapshot_prob=0.5,
+    delayed_snapshot_max_steps=6,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class FaultRecord:
     step: int

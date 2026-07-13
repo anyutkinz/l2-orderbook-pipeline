@@ -23,7 +23,7 @@ def _ts_ns(iso: str) -> int:
 
 
 def _row(
-    ts_local_ns: int,
+    ts_wall_ns: int,
     bids: list[tuple[str, str]],
     asks: list[tuple[str, str]],
     *,
@@ -31,11 +31,15 @@ def _row(
     symbol: str = "BTCUSDT",
     last_applied_id: int = 1,
 ) -> SnapshotRow:
+    # ts_local_ns (monotonic) plays no role in these tests -- only
+    # ts_wall_ns (real epoch time) drives partitioning -- so both fields
+    # are set to the same caller-supplied value for simplicity.
     return SnapshotRow(
         exchange=exchange,
         symbol=symbol,
-        ts_exchange_ms=ts_local_ns // 1_000_000,
-        ts_local_ns=ts_local_ns,
+        ts_exchange_ms=ts_wall_ns // 1_000_000,
+        ts_local_ns=ts_wall_ns,
+        ts_wall_ns=ts_wall_ns,
         last_applied_id=last_applied_id,
         bids=[PriceLevel(Decimal(p), Decimal(q)) for p, q in bids],
         asks=[PriceLevel(Decimal(p), Decimal(q)) for p, q in asks],
@@ -84,10 +88,98 @@ def test_p1_schema_round_trip_byte_exact_prices(tmp_path: Path) -> None:
     assert col("ask_price_0").to_pylist() == [Decimal("64175.84000000"), Decimal("64175.84000000")]
     assert col("ask_qty_0").to_pylist() == [Decimal("9.38033000"), Decimal("0.00000001")]
     assert col("last_applied_id").to_pylist() == [101, 102]
-    assert col("exchange").to_pylist() == ["binance", "binance"]
+    assert col("ts_wall_ns").to_pylist() == [rows[0].ts_wall_ns, rows[1].ts_wall_ns]
+    # exchange/symbol are deliberately NOT in-file columns (see build_schema()
+    # docstring and DECISIONS.md M7) -- they're Hive partition keys only
+    assert "exchange" not in read_back.schema.names
+    assert "symbol" not in read_back.schema.names
 
 
 # P2: rotation & atomicity
+def test_p2_partitioning_uses_ts_wall_ns_not_ts_local_ns(tmp_path: Path) -> None:
+    """Regression test for a real M5 bug M7's stress test found: partition
+    date/hour must come from ts_wall_ns (real epoch time), never
+    ts_local_ns (monotonic, undefined reference point -- on this machine,
+    interpreting it as epoch time lands in 1970). ts_local_ns here is
+    deliberately monotonic-shaped (small, non-epoch) and ts_wall_ns is a
+    real 2026 timestamp -- if partitioning ever regresses to reading the
+    wrong field, this lands in a wildly wrong directory instead of
+    silently looking plausible.
+    """
+    clock = _FakeClock()
+    writer = _RotatingWriter(tmp_path, "binance", "BTCUSDT", build_schema(1), 1, 300.0, clock)
+    row = SnapshotRow(
+        exchange="binance",
+        symbol="BTCUSDT",
+        ts_exchange_ms=None,
+        ts_local_ns=123_000_000_000,  # ~123s of monotonic uptime -- NOT epoch-like
+        ts_wall_ns=_ts_ns("2026-07-13T10:00:00"),
+        last_applied_id=1,
+        bids=[PriceLevel(Decimal("1"), Decimal("1"))],
+        asks=[],
+    )
+    writer.write_batch([row])
+    writer.close()
+
+    expected = (
+        tmp_path / "exchange=binance/symbol=BTCUSDT/date=2026-07-13/hour=10/part-0000.parquet"
+    )
+    assert expected.exists()
+    assert not list(tmp_path.rglob("date=1970*"))  # the exact wrong path this bug produced
+
+
+def test_p2_multi_partition_tree_reads_back_via_default_hive_reader(tmp_path: Path) -> None:
+    """Regression test for a real bug found during M7's manual A3/A4
+    verification: pq.read_table()/pandas.read_parquet() default to
+    partitioning='hive', reconstructing exchange/symbol from the directory
+    path as dictionary-encoded columns. Storing exchange/symbol as
+    plain-string columns *inside* the file too (the pre-fix schema) creates
+    two incompatible representations of the same field name, and reading
+    more than one partition together fails with exactly:
+    "ArrowTypeError: Unable to merge: Field exchange has incompatible
+    types: string vs dictionary<...>". Multiple partitions (binance, okx)
+    and multiple file rotations (two hours) are required to reproduce it --
+    a single file/partition doesn't trigger the merge at all.
+    """
+    schema = build_schema(1)
+    binance_writer = _RotatingWriter(tmp_path, "binance", "BTCUSDT", schema, 1, 300.0, _FakeClock())
+    okx_writer = _RotatingWriter(tmp_path, "okx", "BTC-USDT", schema, 1, 300.0, _FakeClock())
+
+    binance_writer.write_batch(
+        [
+            _row(
+                _ts_ns("2026-07-13T10:00:00"),
+                [("1", "1")],
+                [],
+                exchange="binance",
+                symbol="BTCUSDT",
+            )
+        ]
+    )
+    binance_writer.write_batch(
+        [
+            _row(
+                _ts_ns("2026-07-13T11:00:00"),
+                [("2", "2")],
+                [],
+                exchange="binance",
+                symbol="BTCUSDT",
+            )
+        ]
+    )
+    okx_writer.write_batch(
+        [_row(_ts_ns("2026-07-13T10:00:00"), [("3", "3")], [], exchange="okx", symbol="BTC-USDT")]
+    )
+    binance_writer.close()
+    okx_writer.close()
+
+    # The exact call that failed before the fix -- default partitioning='hive'
+    table = pq.read_table(str(tmp_path))
+    assert table.num_rows == 3
+    assert sorted(table.column("exchange").to_pylist()) == ["binance", "binance", "okx"]
+    assert sorted(table.column("symbol").to_pylist()) == ["BTC-USDT", "BTCUSDT", "BTCUSDT"]
+
+
 def test_p2_hour_boundary_creates_two_finalized_files(tmp_path: Path) -> None:
     clock = _FakeClock()
     writer = _RotatingWriter(tmp_path, "binance", "BTCUSDT", build_schema(1), 1, 300.0, clock)

@@ -1,0 +1,38 @@
+         25538880 function calls (25538846 primitive calls) in 19.561 seconds
+
+   Ordered by: cumulative time
+   List reduced from 424 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000   20.087   20.087 C:\Python312\Lib\asyncio\runners.py:160(run)
+        1    0.000    0.000   20.085   20.085 C:\Python312\Lib\asyncio\runners.py:86(run)
+        3    0.000    0.000   20.085    6.695 C:\Python312\Lib\asyncio\base_events.py:628(run_until_complete)
+        3    0.000    0.000   20.085    6.695 C:\Python312\Lib\asyncio\windows_events.py:317(run_forever)
+        3    0.032    0.011   20.085    6.695 C:\Python312\Lib\asyncio\base_events.py:604(run_forever)
+    51850    0.383    0.000   20.053    0.000 C:\Python312\Lib\asyncio\base_events.py:1874(_run_once)
+   149873    0.133    0.000   19.244    0.000 C:\Python312\Lib\asyncio\events.py:82(_run)
+   149873    0.259    0.000   19.111    0.000 {method 'run' of '_contextvars.Context' objects}
+   103655    0.398    0.000   11.018    0.000 C:\Users\user\Desktop\l2-pipeline\scripts\stress_replay.py:176(_timed_drive)
+   103653    0.231    0.000   10.302    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\simulation\driver.py:70(run_step)
+    45376    0.303    0.000    7.447    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\sinks\parquet_sink.py:286(run)
+   103653    0.552    0.000    6.123    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\simulation\faults.py:103(poll)
+      145    0.054    0.000    5.028    0.035 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\sinks\parquet_sink.py:311(_flush)
+      145    0.021    0.000    4.501    0.031 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\sinks\parquet_sink.py:212(write_batch)
+   103653    0.475    0.000    3.507    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\simulation\market.py:52(step)
+    88453    0.243    0.000    3.271    0.000 C:\Users\user\Desktop\l2-pipeline\scripts\stress_replay.py:107(on_apply)
+      145    2.219    0.015    3.226    0.022 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\sinks\parquet_sink.py:73(rows_to_table)
+   134887    0.504    0.000    2.457    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\simulation\market.py:95(_changes_for_side)
+   118183    0.222    0.000    2.002    0.000 C:\Python312\Lib\asyncio\tasks.py:462(wait_for)
+   103655    0.743    0.000    1.684    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\simulation\market.py:45(snapshot)
+    72001    0.177    0.000    1.547    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\feeds\envelope.py:59(build_snapshot_row)
+  1952940    0.813    0.000    1.303    0.000 <string>:1(<lambda>)
+      145    1.247    0.009    1.247    0.009 C:\Users\user\Desktop\l2-pipeline\.venv\Lib\site-packages\pyarrow\parquet\core.py:1191(write_table)
+    72001    0.537    0.000    1.182    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\book\engine.py:102(top_levels)
+  6236392    0.998    0.000    0.998    0.000 {method 'append' of 'list' objects}
+    72405    0.098    0.000    0.787    0.000 C:\Python312\Lib\asyncio\timeouts.py:84(__aenter__)
+   134887    0.499    0.000    0.664    0.000 C:\Python312\Lib\random.py:454(choices)
+    72405    0.128    0.000    0.649    0.000 C:\Python312\Lib\asyncio\timeouts.py:50(reschedule)
+   183481    0.103    0.000    0.640    0.000 C:\Python312\Lib\random.py:332(randint)
+    72001    0.041    0.000    0.637    0.000 C:\Users\user\Desktop\l2-pipeline\src\l2_pipeline\sinks\parquet_sink.py:130(put)
+
+

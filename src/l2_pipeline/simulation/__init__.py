@@ -7,6 +7,7 @@ from l2_pipeline.simulation.driver import (
     build_simulation,
 )
 from l2_pipeline.simulation.faults import (
+    STORM_FAULT_CONFIG,
     FaultConfig,
     FaultInjector,
     FaultRecord,
@@ -18,6 +19,7 @@ from l2_pipeline.simulation.seeding import derive_seed
 
 __all__ = [
     "DEFAULT_SNAPSHOT_RETRY_LIMIT",
+    "STORM_FAULT_CONFIG",
     "FaultConfig",
     "FaultInjector",
     "FaultRecord",

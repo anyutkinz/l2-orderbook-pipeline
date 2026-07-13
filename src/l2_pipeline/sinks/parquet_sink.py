@@ -15,7 +15,9 @@ import pyarrow.parquet as pq
 
 from l2_pipeline.book.types import PriceLevel
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = (
+    "3"  # bumped from "2": exchange/symbol dropped as in-file columns, see DECISIONS.md M7
+)
 DECIMAL_TYPE = pa.decimal128(18, 8)
 
 DEFAULT_BATCH_SIZE = 500
@@ -25,21 +27,39 @@ DEFAULT_CHECKPOINT_INTERVAL_SECONDS = 300.0
 
 @dataclass(frozen=True, slots=True)
 class SnapshotRow:
+    # exchange/symbol are NOT written as in-file Arrow columns (see
+    # build_schema()) -- they stay on this dataclass because ParquetSink
+    # still needs them in memory, to group rows and build each file's Hive
+    # partition path (exchange=.../symbol=.../...).
     exchange: str
     symbol: str
     ts_exchange_ms: int | None
-    ts_local_ns: int
+    ts_local_ns: int  # monotonic -- deltas/latency only, NOT a real timestamp
+    ts_wall_ns: int  # real epoch time -- this is what partitioning uses
     last_applied_id: int
     bids: list[PriceLevel]  # already top-N and sorted (best first) by BookEngine.top_levels()
     asks: list[PriceLevel]
 
 
 def build_schema(depth_levels: int) -> pa.Schema:
+    """exchange/symbol are deliberately NOT columns here (see M7,
+    DECISIONS.md): they're already Hive partition keys in the directory
+    path (exchange=.../symbol=.../...), and pyarrow's readers -- including
+    pq.read_table()'s and pandas.read_parquet()'s DEFAULTS, both
+    partitioning='hive' -- reconstruct partition-key columns from the path
+    automatically as dictionary-encoded columns. Also storing the same
+    names as plain-string columns *inside* the file creates two
+    conflicting representations of the same field, which a default read
+    across multiple partitions fails to merge (a real bug found during
+    M7's manual verification: `ArrowTypeError: Unable to merge: Field
+    exchange has incompatible types: string vs dictionary<...>`). Standard
+    Hive/Spark/Trino convention is to never duplicate a partition column
+    inside the file for exactly this reason -- this schema now follows it.
+    """
     fields = [
-        pa.field("exchange", pa.string(), nullable=False),
-        pa.field("symbol", pa.string(), nullable=False),
         pa.field("ts_exchange_ms", pa.int64(), nullable=True),
         pa.field("ts_local_ns", pa.int64(), nullable=False),
+        pa.field("ts_wall_ns", pa.int64(), nullable=False),
         pa.field("last_applied_id", pa.int64(), nullable=False),
     ]
     for side in ("ask", "bid"):
@@ -51,21 +71,46 @@ def build_schema(depth_levels: int) -> pa.Schema:
 
 
 def rows_to_table(rows: list[SnapshotRow], depth_levels: int, schema: pa.Schema) -> pa.Table:
+    """Profiling (M7, see DECISIONS.md) found the row loop below re-
+    formatting f"{side}_price_{i}"-style column-name strings and doing a
+    dict lookup by that string on every single row -- 80 of each per row
+    at depth_levels=20 -- the single largest CPU cost in the whole
+    pipeline under stress (~19% of total profiled time). The column list
+    for a given (side, i) never changes across rows, so both the
+    formatting and the lookup are resolved once, here, before the loop;
+    the loop below appends directly to the resolved list objects.
+
+    Verified in isolation (timeit, 500-row batches, depth_levels=20):
+    48.5ms -> 29.8ms per call, a real 1.63x speedup -- but this does NOT
+    move the end-to-end stress-test ceiling (see DECISIONS.md M7): at the
+    plateau observed there, asyncio per-tick scheduling overhead in the
+    harness dominates, not this function. Kept anyway -- it's a genuine,
+    verified reduction in wasted work, independent of whether today's
+    synthetic benchmark happens to be bottlenecked elsewhere.
+    """
     columns: dict[str, list[Any]] = {field.name: [] for field in schema}
+    ts_exchange_ms_col = columns["ts_exchange_ms"]
+    ts_local_ns_col = columns["ts_local_ns"]
+    ts_wall_ns_col = columns["ts_wall_ns"]
+    last_applied_id_col = columns["last_applied_id"]
+    ask_cols = [(columns[f"ask_price_{i}"], columns[f"ask_qty_{i}"]) for i in range(depth_levels)]
+    bid_cols = [(columns[f"bid_price_{i}"], columns[f"bid_qty_{i}"]) for i in range(depth_levels)]
+
     for row in rows:
-        columns["exchange"].append(row.exchange)
-        columns["symbol"].append(row.symbol)
-        columns["ts_exchange_ms"].append(row.ts_exchange_ms)
-        columns["ts_local_ns"].append(row.ts_local_ns)
-        columns["last_applied_id"].append(row.last_applied_id)
-        for side_name, levels in (("ask", row.asks), ("bid", row.bids)):
-            for i in range(depth_levels):
-                if i < len(levels):
-                    columns[f"{side_name}_price_{i}"].append(levels[i].price)
-                    columns[f"{side_name}_qty_{i}"].append(levels[i].qty)
+        # row.exchange/row.symbol are NOT written -- see build_schema()
+        ts_exchange_ms_col.append(row.ts_exchange_ms)
+        ts_local_ns_col.append(row.ts_local_ns)
+        ts_wall_ns_col.append(row.ts_wall_ns)
+        last_applied_id_col.append(row.last_applied_id)
+        for side_cols, levels in ((ask_cols, row.asks), (bid_cols, row.bids)):
+            num_levels = len(levels)
+            for i, (price_col, qty_col) in enumerate(side_cols):
+                if i < num_levels:
+                    price_col.append(levels[i].price)
+                    qty_col.append(levels[i].qty)
                 else:
-                    columns[f"{side_name}_price_{i}"].append(None)
-                    columns[f"{side_name}_qty_{i}"].append(None)
+                    price_col.append(None)
+                    qty_col.append(None)
     arrays = [pa.array(columns[field.name], type=field.type) for field in schema]
     return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -101,8 +146,16 @@ class BoundedRowQueue:
         return self._queue.qsize()
 
 
-def _hour_key_for(ts_local_ns: int) -> str:
-    dt = datetime.fromtimestamp(ts_local_ns / 1e9, tz=UTC)
+def _hour_key_for(ts_wall_ns: int) -> str:
+    """Must be fed real epoch time (SnapshotRow.ts_wall_ns), never
+    ts_local_ns -- that field is monotonic (time.monotonic_ns(), undefined
+    reference point), and silently produces a nonsense partition date if
+    misinterpreted as epoch time instead of erroring. This is exactly the
+    bug M7's stress test found live in M5's original code (every run
+    partitioning under "date=1970-01-19" instead of the real date); see
+    DECISIONS.md M7.
+    """
+    dt = datetime.fromtimestamp(ts_wall_ns / 1e9, tz=UTC)
     return dt.strftime("%Y-%m-%d/%H")
 
 
@@ -161,7 +214,7 @@ class _RotatingWriter:
         by (exchange, symbol, hour_key) before calling this."""
         if not rows:
             return
-        hour_key = _hour_key_for(rows[0].ts_local_ns)
+        hour_key = _hour_key_for(rows[0].ts_wall_ns)
         now = self._clock()
         needs_rotation = (
             self._writer is None
@@ -258,7 +311,7 @@ class ParquetSink:
     def _flush(self, rows: list[SnapshotRow]) -> None:
         groups: dict[tuple[str, str, str], list[SnapshotRow]] = defaultdict(list)
         for row in rows:
-            groups[(row.exchange, row.symbol, _hour_key_for(row.ts_local_ns))].append(row)
+            groups[(row.exchange, row.symbol, _hour_key_for(row.ts_wall_ns))].append(row)
 
         for (exchange, symbol, _hour_key), group_rows in groups.items():
             writer = self._writers.get((exchange, symbol))

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from l2_pipeline.book.engine import BookEngine
-from l2_pipeline.book.types import ApplyStatus, BookState
+from l2_pipeline.book.types import ApplyResult, ApplyStatus, BookState
 from l2_pipeline.simulation.faults import FaultConfig, FaultInjector
 from l2_pipeline.simulation.market import MarketSimulator
 from l2_pipeline.simulation.seeding import derive_seed
@@ -34,11 +35,20 @@ class SimulatedFeedDriver:
         engine: BookEngine,
         seed: int | None = None,
         snapshot_retry_limit: int = DEFAULT_SNAPSHOT_RETRY_LIMIT,
+        on_apply: Callable[[ApplyResult], None] | None = None,
     ) -> None:
         self._injector = injector
         self._engine = engine
         self._seed = seed
         self._snapshot_retry_limit = snapshot_retry_limit
+        # Optional observation hook, added for M7's stress-replay tool so it
+        # can measure real per-event outcomes without duplicating this
+        # class's poll/apply/resync logic. Fired only from run_step()'s
+        # per-event loop below, deliberately not from _sync() -- resync
+        # completion is a different, not-comparable latency shape (same
+        # steady-state-only scope decision M6's processing_latency
+        # histogram already makes for the production feed clients).
+        self._on_apply = on_apply
         self._recoveries: list[RecoveryRecord] = []
         self._stale_snapshot_retries = 0
         self._step = 0
@@ -63,6 +73,8 @@ class SimulatedFeedDriver:
         gap_this_step = False
         for event in self._injector.poll():
             result = self._engine.apply_event(event)
+            if self._on_apply is not None:
+                self._on_apply(result)
             if result.status is ApplyStatus.GAP_DETECTED:
                 gap_this_step = True
         if gap_this_step:
@@ -90,11 +102,16 @@ def build_simulation(
     config: FaultConfig,
     depth_levels: int = 20,
     snapshot_retry_limit: int = DEFAULT_SNAPSHOT_RETRY_LIMIT,
+    on_apply: Callable[[ApplyResult], None] | None = None,
 ) -> tuple[MarketSimulator, FaultInjector, BookEngine, SimulatedFeedDriver]:
     market = MarketSimulator(seed=derive_seed(seed, "market"))
     injector = FaultInjector(market=market, config=config, seed=derive_seed(seed, "fault"))
     engine = BookEngine(depth_levels=depth_levels)
     driver = SimulatedFeedDriver(
-        injector=injector, engine=engine, seed=seed, snapshot_retry_limit=snapshot_retry_limit
+        injector=injector,
+        engine=engine,
+        seed=seed,
+        snapshot_retry_limit=snapshot_retry_limit,
+        on_apply=on_apply,
     )
     return market, injector, engine, driver

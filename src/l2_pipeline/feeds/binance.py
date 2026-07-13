@@ -264,6 +264,7 @@ class BinanceFeedClient:
         while True:
             raw = await asyncio.wait_for(ws.recv(), timeout=self._watchdog_timeout)
             ts_local_ns = time.monotonic_ns()
+            ts_wall_ns = time.time_ns()
             self._connection.message_received()
             self._stats["messages_received"] += 1
 
@@ -284,6 +285,7 @@ class BinanceFeedClient:
 
             timestamped = TimestampedEvent(
                 ts_local_ns=ts_local_ns,
+                ts_wall_ns=ts_wall_ns,
                 instrument=InstrumentId("binance", self._symbol),
                 event=diff,
                 ts_exchange_ms=_extract_ts_exchange_ms(data),
@@ -328,6 +330,7 @@ class BinanceFeedClient:
                         self._engine,
                         timestamped.instrument,
                         timestamped.ts_local_ns,
+                        timestamped.ts_wall_ns,
                         timestamped.ts_exchange_ms,
                     )
                     self._row_queue.put(row)
@@ -397,6 +400,7 @@ class BinanceFeedClient:
                         self._engine,
                         InstrumentId("binance", self._symbol),
                         time.monotonic_ns(),
+                        time.time_ns(),
                         None,  # Binance's REST snapshot body carries no exchange timestamp
                     )
                     self._row_queue.put(row)

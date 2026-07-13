@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from l2_pipeline.book.engine import BookEngine
 from l2_pipeline.simulation import (
+    STORM_FAULT_CONFIG,
     FaultConfig,
     FaultType,
     SimulatedFeedDriver,
@@ -39,17 +40,7 @@ def _drain_until_caught_up(
     raise AssertionError(f"engine did not catch up within {max_extra_steps} extra steps")
 
 
-_STORM_CONFIG = FaultConfig(
-    drop_one_prob=0.05,
-    drop_burst_prob=0.03,
-    drop_burst_max_len=4,
-    duplicate_prob=0.04,
-    reorder_prob=0.04,
-    disconnect_prob=0.01,
-    disconnect_max_len=15,
-    delayed_snapshot_prob=0.5,
-    delayed_snapshot_max_steps=6,
-)
+_STORM_CONFIG = STORM_FAULT_CONFIG
 
 
 def test_s1_clean_run_stays_converged() -> None:

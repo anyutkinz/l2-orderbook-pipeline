@@ -327,6 +327,7 @@ class OKXFeedClient:
                 raw = await self._recv_text(ws, self._pong_timeout)
 
             ts_local_ns = time.monotonic_ns()
+            ts_wall_ns = time.time_ns()
             self._connection.message_received()
             self._stats["messages_received"] += 1
 
@@ -352,7 +353,7 @@ class OKXFeedClient:
                 await self._handle_control_message(envelope)
                 continue
 
-            await self._handle_channel_push(envelope, ts_local_ns)
+            await self._handle_channel_push(envelope, ts_local_ns, ts_wall_ns)
 
     async def _handle_control_message(self, envelope: dict[str, Any]) -> None:
         event = envelope.get("event")
@@ -392,7 +393,9 @@ class OKXFeedClient:
         )
         self._stats["malformed_message"] += 1
 
-    async def _handle_channel_push(self, envelope: dict[str, Any], ts_local_ns: int) -> None:
+    async def _handle_channel_push(
+        self, envelope: dict[str, Any], ts_local_ns: int, ts_wall_ns: int
+    ) -> None:
         try:
             data = unwrap_book_push(envelope)
         except ParseError as exc:
@@ -410,14 +413,14 @@ class OKXFeedClient:
         if action == "snapshot":
             await self._handle_snapshot_push(data)
         elif action == "update":
-            self._handle_update_push(data, ts_local_ns)
+            self._handle_update_push(data, ts_local_ns, ts_wall_ns)
         else:
             self._log(
                 logging.WARNING, "unrecognized action", "MALFORMED_MESSAGE", action=str(action)
             )
             self._stats["malformed_message"] += 1
 
-    def _handle_update_push(self, data: dict[str, Any], ts_local_ns: int) -> None:
+    def _handle_update_push(self, data: dict[str, Any], ts_local_ns: int, ts_wall_ns: int) -> None:
         try:
             diff = parse_book_update(data)
         except ParseError as exc:
@@ -433,6 +436,7 @@ class OKXFeedClient:
 
         timestamped = TimestampedEvent(
             ts_local_ns=ts_local_ns,
+            ts_wall_ns=ts_wall_ns,
             instrument=InstrumentId("okx", self._symbol),
             event=diff,
             ts_exchange_ms=_extract_ts_exchange_ms(data),
@@ -463,6 +467,7 @@ class OKXFeedClient:
                     self._engine,
                     timestamped.instrument,
                     timestamped.ts_local_ns,
+                    timestamped.ts_wall_ns,
                     timestamped.ts_exchange_ms,
                 )
                 self._row_queue.put(row)
@@ -495,6 +500,7 @@ class OKXFeedClient:
                     self._engine,
                     InstrumentId("okx", self._symbol),
                     time.monotonic_ns(),
+                    time.time_ns(),
                     ts_exchange_ms,
                 )
                 self._row_queue.put(row)
