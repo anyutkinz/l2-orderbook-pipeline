@@ -105,6 +105,28 @@ logging: {}
         load_config(_write(tmp_path, content))
 
 
+def test_coalesce_overflow_policy_raises_config_error(tmp_path: Path) -> None:
+    """coalesce is a declared-but-unimplemented placeholder (M0 decision) --
+    BoundedRowQueue (M5) only implements drop_oldest, so selecting it must
+    fail loudly at config load rather than silently behaving like
+    drop_oldest at runtime.
+    """
+    content = """
+exchanges:
+  - name: binance
+    symbols: ["BTCUSDT"]
+    ws_url: "wss://stream.binance.com:9443/ws"
+book: {}
+output:
+  parquet_dir: "./data"
+  overflow_policy: "coalesce"
+metrics: {}
+logging: {}
+"""
+    with pytest.raises(ConfigError, match="not yet implemented"):
+        load_config(_write(tmp_path, content))
+
+
 def test_non_mapping_root_raises_config_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="must be a mapping"):
         load_config(_write(tmp_path, "- just\n- a\n- list\n"))

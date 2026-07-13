@@ -115,6 +115,12 @@ def _parse_output(raw: dict[str, Any]) -> OutputConfig:
         raise ConfigError(
             f"invalid overflow_policy {policy_str!r}, must be one of: {valid}"
         ) from exc
+    if policy is OverflowPolicy.COALESCE:
+        # M5's BoundedRowQueue only implements DROP_OLDEST -- COALESCE
+        # stays a declared-but-unimplemented placeholder (M0 decision), so
+        # selecting it must fail loudly at config load, not silently fall
+        # back to drop-oldest behavior at runtime.
+        raise ConfigError("overflow_policy 'coalesce' is not yet implemented, use 'drop_oldest'")
     return OutputConfig(
         parquet_dir=Path(raw["parquet_dir"]),
         queue_maxsize=raw.get("queue_maxsize", 10_000),

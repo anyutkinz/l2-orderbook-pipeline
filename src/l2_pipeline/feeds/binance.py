@@ -17,13 +17,14 @@ import httpx
 from l2_pipeline.book.engine import BookEngine
 from l2_pipeline.book.types import ApplyStatus, BookState, DiffEvent, PriceLevel, SnapshotEvent
 from l2_pipeline.feeds.connection import BackoffPolicy, ConnectionManager
-from l2_pipeline.feeds.envelope import InstrumentId, TimestampedEvent
+from l2_pipeline.feeds.envelope import InstrumentId, TimestampedEvent, build_snapshot_row
 from l2_pipeline.feeds.ratelimit import (
     DEFAULT_SNAPSHOT_BUCKET_CAPACITY,
     DEFAULT_SNAPSHOT_BUCKET_REFILL_PER_SEC,
     TokenBucket,
 )
 from l2_pipeline.feeds.transport import WebSocketConnector, WebSocketLike
+from l2_pipeline.sinks.parquet_sink import BoundedRowQueue
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,15 @@ def parse_diff_event(data: dict[str, Any]) -> DiffEvent:
     except (KeyError, ValueError, TypeError, decimal.InvalidOperation) as exc:
         raise ParseError(str(exc)) from exc
     return DiffEvent(prev_id=u - 1, final_id=final_id, bids=bids, asks=asks)
+
+
+def _extract_ts_exchange_ms(data: dict[str, Any]) -> int | None:
+    """Binance's own event-time field ("E"), read at the reader-loop call
+    site rather than folded into parse_diff_event -- keeps that function's
+    signature (and its existing tests) untouched.
+    """
+    raw = data.get("E")
+    return int(raw) if raw is not None else None
 
 
 def parse_snapshot(data: dict[str, Any]) -> SnapshotEvent:
@@ -121,6 +131,7 @@ class BinanceFeedClient:
         http_client: HttpClientLike | None = None,
         rng: random.Random | None = None,
         clock: Callable[[], float] | None = None,
+        row_queue: BoundedRowQueue | None = None,
     ) -> None:
         self._symbol = symbol
         self._engine = engine
@@ -130,6 +141,7 @@ class BinanceFeedClient:
         self._http_retry_limit = http_retry_limit
         self._depth_limit = depth_limit
         self._heartbeat_interval = heartbeat_interval_seconds
+        self._row_queue = row_queue
 
         clock = clock or time.monotonic
         rng = rng or random.Random()
@@ -269,6 +281,7 @@ class BinanceFeedClient:
                 ts_local_ns=ts_local_ns,
                 instrument=InstrumentId("binance", self._symbol),
                 event=diff,
+                ts_exchange_ms=_extract_ts_exchange_ms(data),
             )
             logger.debug(
                 "event received",
@@ -291,6 +304,14 @@ class BinanceFeedClient:
                 )
                 self._stats["gap_detected"] += 1
                 self._resync_needed.set()
+            elif result.status is ApplyStatus.APPLIED and self._row_queue is not None:
+                row = build_snapshot_row(
+                    self._engine,
+                    timestamped.instrument,
+                    timestamped.ts_local_ns,
+                    timestamped.ts_exchange_ms,
+                )
+                self._row_queue.put(row)
 
     async def _resync_worker(self) -> None:
         while True:
@@ -352,6 +373,14 @@ class BinanceFeedClient:
                     events_buffered=self._buffered_since_resync,
                 )
                 self._stats["resync_completed"] += 1
+                if self._row_queue is not None:
+                    row = build_snapshot_row(
+                        self._engine,
+                        InstrumentId("binance", self._symbol),
+                        time.monotonic_ns(),
+                        None,  # Binance's REST snapshot body carries no exchange timestamp
+                    )
+                    self._row_queue.put(row)
                 return
 
             if result.status is ApplyStatus.GAP_DETECTED:

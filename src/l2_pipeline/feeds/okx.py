@@ -22,9 +22,10 @@ from l2_pipeline.book.types import (
     SnapshotEvent,
 )
 from l2_pipeline.feeds.connection import BackoffPolicy, ConnectionManager
-from l2_pipeline.feeds.envelope import InstrumentId, TimestampedEvent
+from l2_pipeline.feeds.envelope import InstrumentId, TimestampedEvent, build_snapshot_row
 from l2_pipeline.feeds.ratelimit import TokenBucket
 from l2_pipeline.feeds.transport import WebSocketConnector, WebSocketLike
+from l2_pipeline.sinks.parquet_sink import BoundedRowQueue
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,16 @@ def parse_book_update(data: dict[str, Any]) -> DiffEvent:
     return DiffEvent(prev_id=prev_seq_id, final_id=seq_id, bids=bids, asks=asks)
 
 
+def _extract_ts_exchange_ms(data: dict[str, Any]) -> int | None:
+    """OKX's own push-time field ("ts", a string of epoch milliseconds on
+    both update and snapshot pushes), read at the call site rather than
+    folded into parse_book_update/parse_book_snapshot -- keeps those
+    functions' signatures (and their existing tests) untouched.
+    """
+    raw = data.get("ts")
+    return int(raw) if raw is not None else None
+
+
 def parse_book_snapshot(data: dict[str, Any]) -> SnapshotEvent:
     """books-channel action="snapshot" push -> SnapshotEvent. Sent as the
     first channel message after subscribing -- no separate REST call,
@@ -164,6 +175,7 @@ class OKXFeedClient:
         clock: Callable[[], float] | None = None,
         resubscribe_bucket: TokenBucket | None = None,
         connection_bucket: TokenBucket | None = None,
+        row_queue: BoundedRowQueue | None = None,
     ) -> None:
         self._symbol = symbol
         self._engine = engine
@@ -171,6 +183,7 @@ class OKXFeedClient:
         self._pong_timeout = pong_timeout_seconds
         self._snapshot_retry_limit = snapshot_retry_limit
         self._heartbeat_interval = heartbeat_interval_seconds
+        self._row_queue = row_queue
 
         clock = clock or time.monotonic
         rng = rng or random.Random()
@@ -413,7 +426,10 @@ class OKXFeedClient:
             return
 
         timestamped = TimestampedEvent(
-            ts_local_ns=ts_local_ns, instrument=InstrumentId("okx", self._symbol), event=diff
+            ts_local_ns=ts_local_ns,
+            instrument=InstrumentId("okx", self._symbol),
+            event=diff,
+            ts_exchange_ms=_extract_ts_exchange_ms(data),
         )
         result = self._engine.apply_event(timestamped.event)
         if result.status is ApplyStatus.GAP_DETECTED:
@@ -422,6 +438,14 @@ class OKXFeedClient:
             )
             self._stats["gap_detected"] += 1
             self._resync_needed.set()
+        elif result.status is ApplyStatus.APPLIED and self._row_queue is not None:
+            row = build_snapshot_row(
+                self._engine,
+                timestamped.instrument,
+                timestamped.ts_local_ns,
+                timestamped.ts_exchange_ms,
+            )
+            self._row_queue.put(row)
 
     async def _handle_snapshot_push(self, data: dict[str, Any]) -> None:
         try:
@@ -437,14 +461,23 @@ class OKXFeedClient:
             self._stats["malformed_message"] += 1
             return
 
+        ts_exchange_ms = _extract_ts_exchange_ms(data)
         result = self._engine.load_snapshot(snapshot)
-        await self._handle_resync_result(result)
+        await self._handle_resync_result(result, ts_exchange_ms)
 
-    async def _handle_resync_result(self, result: ApplyResult) -> None:
+    async def _handle_resync_result(self, result: ApplyResult, ts_exchange_ms: int | None) -> None:
         if result.status is ApplyStatus.APPLIED:
             self._snapshot_retry_count = 0
             self._log(logging.INFO, "resync completed", "RESYNC_COMPLETED")
             self._stats["resync_completed"] += 1
+            if self._row_queue is not None:
+                row = build_snapshot_row(
+                    self._engine,
+                    InstrumentId("okx", self._symbol),
+                    time.monotonic_ns(),
+                    ts_exchange_ms,
+                )
+                self._row_queue.put(row)
             return
 
         self._snapshot_retry_count += 1
