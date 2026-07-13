@@ -774,3 +774,209 @@ side lives in `binance.py` (or was already there since M3); `book/`,
 `connection.py`, `ratelimit.py` appear in neither column, by design and
 by `git diff --stat`.
 
+## M5 — Multi-feed concurrency + Parquet sink
+
+### Row format: one self-contained top-N snapshot per Parquet row
+
+Each `SnapshotRow` is a full top-`depth_levels` book snapshot (flat,
+per-level interleaved `{side}_price_{i}`/`{side}_qty_{i}` columns), written
+event-driven on every `ApplyStatus.APPLIED` result — not a delta row that
+depends on the row before it. Lineage: Tardis.dev's `book_snapshot` format
+and NautilusTrader's Parquet catalog both use this shape for the same
+reason we need it here — a delta-row format is more compact, but losing
+one delta row (queue overflow, a crash mid-batch) corrupts every row after
+it until the next full resync, whereas losing a self-contained snapshot
+row just reduces sampling density at that instant. Given `BoundedRowQueue`
+already has a real drop policy (below), "a drop is safe by construction"
+was worth the extra bytes per row.
+
+`bids`/`asks` come from `engine.top_levels()` called with no explicit `n`
+— it defaults to the depth the engine was already constructed with, not a
+second, independently-specified depth at the sink layer. Thin sides pad
+with **null, not zero**: a zero-quantity level looks like a real level
+that happens to have no size (and `apply_levels()` in `book/engine.py`
+already uses zero-qty as its own "delete this level" sentinel on the wire)
+— reusing it for "no level exists here" would make a thin book
+indistinguishable from a deleted one downstream. `build_schema()` pads
+explicitly with `None` (P1 asserts this directly, not just that the
+present levels round-trip correctly).
+
+### `decimal128(18, 8)` for price and quantity, not `float` or `string`
+
+Matches the decimal precision actually observed on the wire (Binance and
+OKX both send `qty` strings with 8 decimal places in the golden fixtures
+captured back in M3/M4, e.g. `"0.11117000"`) rather than an arbitrarily
+chosen scale. `float` was never a candidate — `Decimal` is already the
+type used everywhere upstream (`PriceLevel`, `book/engine.py`), so writing
+`float` to the sink would silently reintroduce the exact rounding-error
+class the rest of the pipeline was built to avoid. `string` would preserve
+precision too but forces every downstream reader (pandas, DuckDB, a
+backtester) to parse before it can do arithmetic — `decimal128` is exact
+*and* directly usable. Verified byte-exact via round-trip (P1): write a
+table with realistic 8-decimal prices, read it back, assert the `Decimal`
+values compare equal — not merely assumed to be lossless because pyarrow
+documents it that way.
+
+### Sink architecture: one `ParquetSink`, one `BoundedRowQueue`, `drop_oldest`
+
+A single sink task, fed by one bounded `asyncio.Queue` shared by every
+feed client. Feed clients call `BoundedRowQueue.put()`, which is fully
+synchronous — never awaits, never touches disk — so a slow or stalled
+sink can never backpressure the reader loop that's parsing live exchange
+messages. On overflow it evicts the oldest queued row before enqueueing
+the new one (`overflow_policy: drop_oldest`, the only variant actually
+implemented — see below), incrementing a `rows_dropped` counter surfaced
+in both `get_stats()` and the new pipeline-wide heartbeat. This is the
+first real logic behind the `OverflowPolicy` enum M0 only stubbed out;
+`COALESCE` stays declared-but-unimplemented, and `config.py` now rejects
+it at load time (`test_coalesce_overflow_policy_raises_config_error`)
+instead of silently behaving like `drop_oldest` if someone selects it.
+
+P3 proves the backpressure guarantee two ways: `put()` on a full queue of
+5 synchronous calls completes in well under the sanity bound with no
+consumer ever draining (standing in for an arbitrarily slow/stalled
+sink — no separate async consumer task is needed to prove this, since
+`put()`'s latency is independent of `get()` by construction), and the
+surviving rows after eviction are the newest 3, in FIFO order.
+
+### The finalization gap: from "up to an hour" to "at most one checkpoint interval"
+
+The original design only finalized `.tmp → final` (via `Path.replace()`)
+at hour rotation or graceful shutdown. An ungraceful crash (`kill -9`,
+power loss, OOM) landing mid-hour would leave the entire hour's data in an
+orphaned, non-Hive-visible `.tmp` file — up to ~1 hour of buffered data
+lost with no declared recovery path. Flagged explicitly rather than
+shipped silently.
+
+Chose **checkpoint-based finalization** (`_RotatingWriter` finalizes at
+the hour boundary *or* every `checkpoint_interval_seconds` — 5 minutes by
+default — whichever comes first, checked lazily on each incoming batch)
+over the two alternatives considered:
+
+- **Accept and document the full-hour gap** — simplest, but a 5-min-quant
+  portfolio project with an undefended hour-long data-loss window is a
+  worse interview conversation than the modest complexity of fixing it.
+- **Finalize every batch** — the tightest possible bound (loses at most
+  one `flush_interval_seconds`, i.e. a few seconds), but at the default
+  `batch_size`/`flush_interval` this means a new Parquet file every few
+  seconds per `(exchange, symbol)` pair — file-count explosion that hurts
+  every downstream reader (more file-open overhead, worse compression
+  ratio per file, slower Hive-style glob reads) for a durability bound
+  far tighter than this pipeline actually needs.
+
+5 minutes is the deliberate middle: bounds worst-case loss to a number
+small enough to defend, without fragmenting output into thousands of
+tiny files during a multi-hour run. The check itself costs nothing extra
+— it rides on `write_batch()`, which was already being called on every
+flush; there's no separate proactive timer, since during genuine silence
+there's nothing new at risk to checkpoint anyway. `Path.replace()`
+(atomic cross-platform, unlike bare `os.rename` which raises on Windows
+if the target exists) is the only thing that ever produces the final
+name, so a crash can only ever leave an orphaned `.tmp`, never a
+partially-written file masquerading as a finalized one.
+
+`test_p2_ungraceful_crash_loses_at_most_one_checkpoint_interval` is the
+test this decision demanded: write 3 batches with a fake clock advanced
+past `checkpoint_interval_seconds` between writes 1 and 2, then never call
+`close()` (simulating `kill -9`). Asserts exactly one finalized,
+independently-readable `part-*.parquet` file exists (checkpoint 1's data)
+and exactly one orphaned `.tmp` exists (checkpoint 2's data — at risk,
+but bounded, and not falsely readable as a complete file since
+`ParquetWriter.close()` was never called to write its footer).
+
+### `FeedSupervisor`, not `asyncio.TaskGroup`
+
+`asyncio.TaskGroup` cancels every sibling task the instant one raises —
+exactly the opposite of what a multi-feed pipeline needs. One exchange's
+websocket hiccuping should never take the other exchange's feed down with
+it. `FeedSupervisor` gives each of the two task kinds it owns (feed tasks,
+the one sink task) the failure semantics that actually fit it:
+
+- **Feed failures are expected.** A crashed feed factory gets restarted
+  with the same AWS full-jitter backoff formula used for reconnects
+  (`full_jitter_delay`, extracted below), up to `max_restarts` within a
+  rolling `restart_window_seconds` window. Exceeding the budget marks the
+  feed `PERMANENTLY_FAILED` and leaves it dead — every *other* feed and
+  the sink keep running, which is the entire point of not using
+  `TaskGroup`. `restart_count` only increments on a crash that actually
+  leads to a restart, not on the final crash that gives up — so
+  `max_restarts=2` means exactly 2 restarts are attempted (3 total calls
+  to the factory), matching the name literally (P4).
+- **Sink failure is process-critical.** Parquet writes are the only
+  reason this process exists, so the sink is never restarted — a crash
+  there triggers `request_shutdown()` via the same `asyncio.Event` used
+  for external shutdown requests (Ctrl+C, SIGTERM), which cancels every
+  feed task and lets `ParquetSink.run()`'s `finally` block flush and
+  finalize whatever writers are open, rather than silently continuing to
+  drop rows into a queue nobody is draining (P5).
+
+P4 covers both a feed that permanently fails (isolated from its healthy
+sibling and the sink) and a feed that crashes once and then recovers
+within its restart budget — the recovered feed's state settles back to
+`RUNNING`, not stuck in `RESTARTING`.
+
+### `full_jitter_delay` extracted from `ConnectionManager.disconnected()`
+
+`ConnectionManager` already implemented `uniform(0, min(cap, base *
+2**attempt))` inline for reconnect backoff. `FeedSupervisor` needed the
+identical formula for restart backoff, but restart backoff has no
+`ConnectionManager` instance to attach to — it's keyed by feed name, not
+by a single connection's state machine. Pulled the formula out to a
+standalone function (`full_jitter_delay(policy, attempt, rng) ->
+float`) rather than duplicating the arithmetic a second time or giving
+`FeedSupervisor` a fake `ConnectionManager` it doesn't otherwise need.
+`ConnectionManager.disconnected()` now calls the extracted function;
+`test_connection.py`'s full T1 suite (8 tests) passes completely
+unmodified, confirming the extraction changed nothing observable.
+
+### `ts_exchange_ms` and row emission: extracted at the call site, not inside the parsers
+
+`TimestampedEvent` gained an optional `ts_exchange_ms: int | None` field.
+Binance's `E` field and OKX's `ts` field are read where each reader loop
+already has the raw parsed `dict` in hand (`_extract_ts_exchange_ms()` in
+each client), specifically *not* folded into `parse_diff_event()` /
+`parse_book_update()` — those functions' signatures, and every test that
+already pins them, stay untouched (confirmed via `git diff` showing zero
+change to either function body). OKX's resync path gets a real exchange
+timestamp (the snapshot push's own `"ts"` field, threaded through
+`_handle_resync_result`); Binance's REST snapshot response carries no
+timestamp field at all, so its resync-completion row honestly records
+`ts_exchange_ms=None` rather than reusing the local receive time under a
+field name that implies it came from the exchange.
+
+Building a `SnapshotRow` from engine state is identical logic for both
+exchanges — not a protocol-specific divergence like the keepalive split
+in M4 — so it lives once, as `build_snapshot_row()` in `envelope.py`
+(already the shared normalization boundary), called from both clients
+after every `ApplyStatus.APPLIED` result, whether that result came from
+`apply_event()` (steady-state diff) or `load_snapshot()` (resync
+completing). Each client holds an optional `row_queue: BoundedRowQueue |
+None` constructor parameter — `None` by default, so every existing test
+that constructs a client without one is unaffected — and calls
+`row_queue.put(row)` directly, matching the design's "feed clients
+enqueue non-blockingly" decision literally rather than through an
+intermediate generic callback.
+
+### Test evidence
+
+Full suite: 87 tests (74 at the end of M4 + 13 new — `test_parquet_sink.py`
+×6 covering P1/P2/P3, `test_supervisor.py` ×5 covering P4/P5, the P6
+end-to-end simulation test, and one new config-validation test), `mypy
+--strict` clean across 38 source files, `ruff` clean. P6
+(`test_p6_simulation_row_matches_oracle_top_n`) is the strongest single
+piece of evidence for the whole milestone: drives a *real* `BookEngine`
+through the M2 harness under an active fault mix (drops, duplicates,
+reorders, disconnects, delayed snapshots — `injector.log` is asserted
+non-empty, so this isn't a fault-free run coasting through), builds a row
+from the converged engine state, pushes it through a *real* `ParquetSink`
+(not a mock — the actual async run loop, actual `pyarrow` write, actual
+file finalize on shutdown), reads the file back, and compares every
+price/qty column against the M2 oracle's own top-N. Nothing in that chain
+is faked.
+
+**Handed off, not automated**: A3 (a 30-60 minute live dual-feed run
+against real Binance/OKX) is the user's own manual verification step —
+this milestone's automated suite proves the pipeline's *logic*, not that
+it survives real network conditions unattended for an hour, which no
+unit test can honestly claim.
+
