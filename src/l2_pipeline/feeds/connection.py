@@ -29,6 +29,15 @@ class ConnectedInfo:
     outage_duration_seconds: float | None
 
 
+def full_jitter_delay(policy: BackoffPolicy, attempt: int, rng: RandomLike) -> float:
+    """AWS "full jitter" backoff: uniform(0, min(cap, base * 2**attempt)).
+    Standalone so restart-backoff callers (e.g. FeedSupervisor) can reuse
+    the exact same formula without depending on ConnectionManager's own
+    attempt-counter state machine.
+    """
+    return rng.uniform(0, min(policy.cap_seconds, policy.base_seconds * (2**attempt)))
+
+
 class ConnectionManager:
     """Pure connection-lifecycle state machine. Never sleeps or performs
     I/O itself -- disconnected() returns a delay for the caller to await,
@@ -80,8 +89,6 @@ class ConnectionManager:
         del reason
         self._state = ConnectionState.BACKOFF
         self._disconnected_at = self._clock()
-        delay = self._rng.uniform(
-            0, min(self._policy.cap_seconds, self._policy.base_seconds * (2**self._attempt))
-        )
+        delay = full_jitter_delay(self._policy, self._attempt, self._rng)
         self._attempt += 1
         return delay
