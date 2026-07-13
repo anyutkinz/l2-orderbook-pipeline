@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: l2-pipeline
+    static_configs:
+      # The app runs on the host (not in this compose stack), publishing
+      # metrics on config.metrics.prometheus_port (default 9100 -- see
+      # config/default.yaml). host.docker.internal is how a container
+      # reaches that host-published port, see docker-compose.yml.
+      - targets: ["host.docker.internal:9100"]

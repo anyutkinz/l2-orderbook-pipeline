@@ -1,0 +1,174 @@
+{
+  "id": null,
+  "uid": "l2-pipeline",
+  "title": "L2 Pipeline",
+  "description": "M6: processing latency, feed lag, throughput, incidents, sink health, per-feed state.",
+  "tags": ["l2-pipeline"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Processing latency (p50 / p95 / p99)",
+      "description": "Time from frame receipt to an APPLIED diff-apply result, one monotonic clock. Steady-state diff applies only -- resync completions are excluded (see DECISIONS.md).",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 1 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum(rate(l2_processing_latency_seconds_bucket[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(l2_processing_latency_seconds_bucket[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum(rate(l2_processing_latency_seconds_bucket[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p99"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Feed lag (approximate)",
+      "description": "Wall-clock now minus the exchange's own event timestamp. Cross-clock, subject to skew -- operational signal, not a precise measurement.",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 1 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "l2_feed_lag_seconds",
+          "legendFormat": "{{exchange}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Messages/sec per feed",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "lineWidth": 1 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(l2_messages_received_total[1m])) by (exchange)",
+          "legendFormat": "{{exchange}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Incidents/sec (reconnects, gaps, resyncs, watchdog trips)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 1 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(l2_ws_reconnects_total[5m])) by (exchange)",
+          "legendFormat": "{{exchange}} reconnects"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(l2_gaps_detected_total[5m])) by (exchange)",
+          "legendFormat": "{{exchange}} gaps"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(l2_resyncs_completed_total[5m])) by (exchange)",
+          "legendFormat": "{{exchange}} resyncs"
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(l2_watchdog_trips_total[5m])) by (exchange)",
+          "legendFormat": "{{exchange}} watchdog trips"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Sink: rows written/sec, rows dropped/sec, queue depth",
+      "description": "Queue depth (a gauge, right-hand scale by eye) shares this panel with the two rate series for space -- see the single shared BoundedRowQueue in DECISIONS.md M5.",
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "lineWidth": 1 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(l2_sink_rows_written_total[1m])",
+          "legendFormat": "rows written/sec"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(l2_sink_rows_dropped_total[1m])",
+          "legendFormat": "rows dropped/sec"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "l2_sink_queue_depth",
+          "legendFormat": "queue depth"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "state-timeline",
+      "title": "Per-feed state (supervisor)",
+      "description": "running / restarting / permanently_failed / stopped, from FeedSupervisor.",
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 6 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "l2_feed_state",
+          "legendFormat": "{{exchange}} - {{l2_feed_state}}"
+        }
+      ]
+    }
+  ]
+}
