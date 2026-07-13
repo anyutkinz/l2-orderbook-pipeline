@@ -5,6 +5,7 @@ description = "Multi-exchange L2 order book ingestion and reconstruction pipelin
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "httpx>=0.28.1",
+    "prometheus-client>=0.25.0",
     "pyarrow>=25.0.0",
     "pyyaml>=6.0",
     "websockets>=16.1",
