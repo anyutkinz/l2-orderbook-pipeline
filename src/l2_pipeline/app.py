@@ -5,30 +5,45 @@ import asyncio
 import logging
 import signal
 from pathlib import Path
+from typing import Protocol
 
 from l2_pipeline.book.engine import BookEngine
-from l2_pipeline.config import AppConfig, load_config
+from l2_pipeline.config import AppConfig, ExchangeConfig, load_config
 from l2_pipeline.feeds.binance import BinanceFeedClient
+from l2_pipeline.feeds.okx import OKXFeedClient
 from l2_pipeline.logging_setup import configure_logging
 
 logger = logging.getLogger(__name__)
 
 
-async def _run_binance_feed(config: AppConfig) -> None:
-    exchange = next((e for e in config.exchanges if e.name == "binance"), None)
-    if exchange is None:
-        raise ValueError("config has no 'binance' exchange entry")
+class _FeedClient(Protocol):
+    async def run(self) -> None: ...
+
+
+def _build_client(exchange: ExchangeConfig, engine: BookEngine) -> _FeedClient:
     symbol = exchange.symbols[0]
+    if exchange.name == "binance":
+        return BinanceFeedClient(symbol, engine)
+    if exchange.name == "okx":
+        return OKXFeedClient(symbol, engine)
+    raise ValueError(f"unsupported exchange {exchange.name!r}")
 
-    engine = BookEngine(depth_levels=config.book.depth_levels)
-    client = BinanceFeedClient(symbol, engine)
 
-    task = asyncio.create_task(client.run())
+async def _run_feeds(config: AppConfig) -> None:
+    clients = [
+        _build_client(exchange, BookEngine(depth_levels=config.book.depth_levels))
+        for exchange in config.exchanges
+    ]
+    tasks = [asyncio.create_task(client.run()) for client in clients]
     loop = asyncio.get_running_loop()
 
     def _request_shutdown() -> None:
-        logger.info("shutdown requested", extra={"extra_fields": {"symbol": symbol}})
-        task.cancel()
+        logger.info(
+            "shutdown requested",
+            extra={"extra_fields": {"exchanges": [e.name for e in config.exchanges]}},
+        )
+        for task in tasks:
+            task.cancel()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -41,10 +56,18 @@ async def _run_binance_feed(config: AppConfig) -> None:
             # via task cancellation, without relying on KeyboardInterrupt.
             pass
 
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for exchange, result in zip(config.exchanges, results, strict=True):
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            logger.error(
+                "feed client exited with an unhandled exception",
+                extra={
+                    "extra_fields": {
+                        "exchange": exchange.name,
+                        "error": f"{type(result).__name__}: {result}",
+                    }
+                },
+            )
 
 
 def main() -> None:
@@ -65,7 +88,7 @@ def main() -> None:
     )
 
     try:
-        asyncio.run(_run_binance_feed(config))
+        asyncio.run(_run_feeds(config))
     except KeyboardInterrupt:
         logger.info("interrupted, shutting down")
 
