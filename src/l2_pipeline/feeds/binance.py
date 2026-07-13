@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Any, Protocol, cast
 
 import httpx
+from prometheus_client import Gauge, Histogram
 
 from l2_pipeline.book.engine import BookEngine
 from l2_pipeline.book.types import ApplyStatus, BookState, DiffEvent, PriceLevel, SnapshotEvent
@@ -132,6 +133,8 @@ class BinanceFeedClient:
         rng: random.Random | None = None,
         clock: Callable[[], float] | None = None,
         row_queue: BoundedRowQueue | None = None,
+        processing_latency: Histogram | None = None,
+        feed_lag: Gauge | None = None,
     ) -> None:
         self._symbol = symbol
         self._engine = engine
@@ -142,6 +145,8 @@ class BinanceFeedClient:
         self._depth_limit = depth_limit
         self._heartbeat_interval = heartbeat_interval_seconds
         self._row_queue = row_queue
+        self._processing_latency = processing_latency
+        self._feed_lag = feed_lag
 
         clock = clock or time.monotonic
         rng = rng or random.Random()
@@ -304,14 +309,28 @@ class BinanceFeedClient:
                 )
                 self._stats["gap_detected"] += 1
                 self._resync_needed.set()
-            elif result.status is ApplyStatus.APPLIED and self._row_queue is not None:
-                row = build_snapshot_row(
-                    self._engine,
-                    timestamped.instrument,
-                    timestamped.ts_local_ns,
-                    timestamped.ts_exchange_ms,
-                )
-                self._row_queue.put(row)
+            elif result.status is ApplyStatus.APPLIED:
+                # Latency/lag are only observed here, for steady-state diff
+                # applies -- not at resync completion, which is a network-
+                # bound, entirely different latency shape that would pollute
+                # this histogram's buckets.
+                if self._processing_latency is not None:
+                    elapsed_ns = time.monotonic_ns() - timestamped.ts_local_ns
+                    self._processing_latency.labels(
+                        exchange="binance", symbol=self._symbol
+                    ).observe(elapsed_ns / 1e9)
+                if self._feed_lag is not None and timestamped.ts_exchange_ms is not None:
+                    self._feed_lag.labels(exchange="binance", symbol=self._symbol).set(
+                        time.time() - timestamped.ts_exchange_ms / 1000.0
+                    )
+                if self._row_queue is not None:
+                    row = build_snapshot_row(
+                        self._engine,
+                        timestamped.instrument,
+                        timestamped.ts_local_ns,
+                        timestamped.ts_exchange_ms,
+                    )
+                    self._row_queue.put(row)
 
     async def _resync_worker(self) -> None:
         while True:
