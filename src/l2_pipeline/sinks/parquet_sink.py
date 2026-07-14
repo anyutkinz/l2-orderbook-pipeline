@@ -23,6 +23,7 @@ DECIMAL_TYPE = pa.decimal128(18, 8)
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_FLUSH_INTERVAL_SECONDS = 5.0
 DEFAULT_CHECKPOINT_INTERVAL_SECONDS = 300.0
+DEFAULT_STALL_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +264,7 @@ class ParquetSink:
         batch_size: int = DEFAULT_BATCH_SIZE,
         flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS,
         checkpoint_interval_seconds: float = DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+        stall_timeout_seconds: float = DEFAULT_STALL_TIMEOUT_SECONDS,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._queue = queue
@@ -271,10 +273,14 @@ class ParquetSink:
         self._batch_size = batch_size
         self._flush_interval = flush_interval_seconds
         self._checkpoint_interval = checkpoint_interval_seconds
+        self._stall_timeout = stall_timeout_seconds
         self._clock = clock or time.monotonic
         self._schema = build_schema(depth_levels)
         self._writers: dict[tuple[str, str], _RotatingWriter] = {}
         self._stats: dict[str, int] = defaultdict(int)
+        self._buffer: list[SnapshotRow] = []
+        self._last_flush = 0.0
+        self._last_progress_at = 0.0
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -284,29 +290,101 @@ class ParquetSink:
         }
 
     async def run(self) -> None:
-        buffer: list[SnapshotRow] = []
-        last_flush = self._clock()
+        self._buffer = []
+        self._last_flush = self._clock()
+        self._last_progress_at = self._clock()
         try:
-            while True:
-                remaining = self._flush_interval - (self._clock() - last_flush)
-                try:
-                    row = await asyncio.wait_for(self._queue.get(), timeout=max(remaining, 0.0))
-                    buffer.append(row)
-                except TimeoutError:
-                    pass
-
-                now = self._clock()
-                if len(buffer) >= self._batch_size or (
-                    buffer and now - last_flush >= self._flush_interval
-                ):
-                    self._flush(buffer)
-                    buffer = []
-                    last_flush = now
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._consume())
+                tg.create_task(self._watchdog())
         finally:
-            if buffer:
-                self._flush(buffer)
+            if self._buffer:
+                self._flush(self._buffer)
+                self._buffer = []
             for writer in self._writers.values():
                 writer.close()
+
+    async def _consume(self) -> None:
+        """The one and only place asyncio.wait_for()'s timeout is computed.
+
+        A real production hang traced to this loop (see DECISIONS.md M8):
+        `asyncio.wait_for(coro, timeout=T)` with T <= 0 cancels the wrapped
+        coroutine and raises TimeoutError *without ever giving it a chance
+        to run* -- ensure_future() always defers actual execution to the
+        next loop iteration, so even a queue that already has items waiting
+        never gets to yield one. The old code computed `remaining` as
+        `flush_interval - (clock() - last_flush)` and clamped it to >= 0,
+        so once anything stalled this coroutine's scheduling for longer
+        than flush_interval (a long GC pause, and confirmed live: the host
+        OS suspending/resuming), `remaining` went negative. Because the
+        buffer was still empty at that exact call, `last_flush` was never
+        updated afterward either, so `remaining` stayed negative forever:
+        a permanent livelock where the queue filled to `maxsize` and
+        BoundedRowQueue's drop-oldest policy silently discarded every row
+        from then on, with `rows_written`/`batches_flushed` frozen and no
+        exception ever raised for FeedSupervisor to notice.
+
+        Fixed by never handing wait_for a timeout <= 0: whenever the
+        interval has already elapsed, flush immediately (buffer or not)
+        and reset `last_flush` right here, before computing a timeout, so
+        the next wait_for call always gets a fresh, strictly positive
+        window and queue.get() is guaranteed an actual chance to run.
+        """
+        while True:
+            remaining = self._flush_interval - (self._clock() - self._last_flush)
+            if remaining <= 0:
+                if self._buffer:
+                    self._flush(self._buffer)
+                    self._buffer = []
+                self._last_flush = self._clock()
+                remaining = self._flush_interval
+
+            try:
+                row = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                self._buffer.append(row)
+                self._last_progress_at = self._clock()
+            except TimeoutError:
+                pass
+
+            now = self._clock()
+            if len(self._buffer) >= self._batch_size or (
+                self._buffer and now - self._last_flush >= self._flush_interval
+            ):
+                self._flush(self._buffer)
+                self._buffer = []
+                self._last_flush = now
+                self._last_progress_at = now
+
+    async def _watchdog(self) -> None:
+        """Defense in depth, independent of the fix in `_consume()`: if
+        rows are queued but nothing has drained the queue for
+        `stall_timeout_seconds` (a future regression in `_consume()`, or a
+        genuinely blocking call inside `_flush()` such as a stalled disk
+        write), raise here rather than let the pipeline silently drop rows
+        forever. Runs as a TaskGroup sibling of `_consume()` so either one
+        failing tears down `run()` as a unit; the raised exception then
+        propagates out of `run()` to `FeedSupervisor._run_sink()`'s
+        existing crash handling, which logs it and calls
+        request_shutdown() -- no changes needed there, since a sink hang
+        is exactly the "process-critical" failure that path already exists
+        to catch, it just never fired for a hang that raised nothing.
+
+        A queue that's merely idle (nothing to drain) is not a stall --
+        the check requires the queue to actually have rows waiting.
+        """
+        check_interval = max(self._stall_timeout / 4, 1.0)
+        while True:
+            await asyncio.sleep(check_interval)
+            stalled_for = self._clock() - self._last_progress_at
+            queued = self._queue.qsize()
+            if stalled_for >= self._stall_timeout and queued > 0:
+                raise RuntimeError(
+                    f"ParquetSink stalled: no row consumed or batch flushed "
+                    f"for {stalled_for:.1f}s while {queued} rows are queued "
+                    f"(stall_timeout_seconds={self._stall_timeout}); treating "
+                    "this as a hang, since an idle sink would have an empty "
+                    "queue, not a full one."
+                )
 
     def _flush(self, rows: list[SnapshotRow]) -> None:
         groups: dict[tuple[str, str, str], list[SnapshotRow]] = defaultdict(list)

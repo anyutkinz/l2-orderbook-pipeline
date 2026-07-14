@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
 
 from l2_pipeline.book.types import PriceLevel
 from l2_pipeline.sinks.parquet_sink import (
     SCHEMA_VERSION,
     BoundedRowQueue,
+    ParquetSink,
     SnapshotRow,
     _RotatingWriter,
     build_schema,
@@ -285,3 +289,115 @@ async def test_p3_backpressure_newest_rows_survive_in_fifo_order() -> None:
 
     survivors = [await queue.get() for _ in range(3)]
     assert [row.last_applied_id for row in survivors] == [2, 3, 4]
+
+
+# P7: sink stall / livelock (real production incident, see DECISIONS.md M8)
+async def test_p7_consume_recovers_after_a_stall_instead_of_livelocking(tmp_path: Path) -> None:
+    """Regression test for a real production hang: `_consume()` used to
+    compute `remaining = flush_interval - (clock() - last_flush)` and pass
+    `max(remaining, 0.0)` straight to `asyncio.wait_for()`. Once anything
+    delayed this coroutine's next tick by more than flush_interval (the
+    live incident: the host OS suspending for tens of minutes),
+    `remaining` went negative, so `wait_for(..., timeout=0)` fired --
+    which cancels and raises TimeoutError *without ever giving
+    queue.get() a chance to run*, even with rows already sitting in the
+    queue. Because the buffer stayed empty at that call, `last_flush` was
+    never updated afterward either, so `remaining` stayed negative
+    forever: a permanent livelock where BoundedRowQueue's drop-oldest
+    policy silently discarded every row from then on.
+
+    Reproduced here by setting `_last_flush` the way `run()` would at
+    startup, then advancing the fake clock by a large amount *before*
+    `_consume()` ever gets a single iteration -- exactly the "stall
+    between setting last_flush and the coroutine's next scheduled tick"
+    shape of the live bug -- with a row already queued.
+    """
+    clock = _FakeClock(start=1000.0)
+    queue = BoundedRowQueue(maxsize=10)
+    queue.put(_row(_ts_ns("2026-07-13T10:00:00"), [("1", "1")], []))
+
+    sink = ParquetSink(
+        queue, tmp_path, depth_levels=1, batch_size=1, flush_interval_seconds=5.0, clock=clock
+    )
+    sink._last_flush = clock.now
+    sink._last_progress_at = clock.now
+    clock.now += 3600.0  # simulate a long stall, far past flush_interval
+
+    consume_task = asyncio.create_task(sink._consume())
+    try:
+        for _ in range(1000):
+            if sink.get_stats()["counters"].get("batches_flushed", 0) >= 1:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("sink livelocked: the queued row was never drained")
+    finally:
+        consume_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consume_task
+
+
+async def test_p7_watchdog_raises_when_queue_backs_up_without_progress(tmp_path: Path) -> None:
+    """Defense in depth, independent of the fix above: if rows are queued
+    but nothing drains the queue for stall_timeout_seconds, the watchdog
+    must raise so FeedSupervisor's existing crash-handling (log + full
+    shutdown, see DECISIONS.md M5) actually fires for a hang -- instead
+    of the pipeline running for hours with feed_states staying "running"
+    and rows_dropped climbing silently, exactly as happened live.
+    """
+    clock = _FakeClock()
+    queue = BoundedRowQueue(maxsize=5)
+    queue.put(_row(_ts_ns("2026-07-13T10:00:00"), [("1", "1")], []))
+
+    sink = ParquetSink(queue, tmp_path, depth_levels=1, stall_timeout_seconds=2.0, clock=clock)
+    sink._last_progress_at = clock.now
+    clock.now += 10.0  # far past stall_timeout_seconds, with a row still queued
+
+    with pytest.raises(RuntimeError, match="stalled"):
+        await asyncio.wait_for(sink._watchdog(), timeout=5.0)
+
+
+async def test_p7_watchdog_does_not_raise_when_queue_is_merely_idle(tmp_path: Path) -> None:
+    """An empty queue for a long time is legitimate idleness, not a stall
+    -- only a *non-empty* queue with no progress is a hang. Guards against
+    the watchdog becoming a source of false-positive shutdowns."""
+    clock = _FakeClock()
+    queue = BoundedRowQueue(maxsize=5)  # deliberately never populated
+
+    sink = ParquetSink(queue, tmp_path, depth_levels=1, stall_timeout_seconds=2.0, clock=clock)
+    sink._last_progress_at = clock.now
+    clock.now += 10.0  # long idle period, but the queue is empty throughout
+
+    watchdog_task = asyncio.create_task(sink._watchdog())
+    try:
+        await asyncio.sleep(1.2)  # let at least one check_interval elapse
+        assert not watchdog_task.done()
+    finally:
+        watchdog_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog_task
+
+
+async def test_p7_run_propagates_a_child_task_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves the asyncio.TaskGroup wiring in run(): if the watchdog (or
+    _consume) raises, run() itself raises too, rather than swallowing it.
+    This is what lets FeedSupervisor._run_sink()'s existing `except
+    Exception:` handler (log + request_shutdown()) fire for a stalled
+    sink -- no changes needed there, since a hang that raises is exactly
+    the "process-critical" failure that path already exists to catch; it
+    simply never fired for a hang that raised nothing.
+    """
+    clock = _FakeClock()
+    queue = BoundedRowQueue(maxsize=5)
+    sink = ParquetSink(queue, tmp_path, depth_levels=1, clock=clock)
+
+    async def _fake_watchdog() -> None:
+        raise RuntimeError("simulated sink stall")
+
+    monkeypatch.setattr(sink, "_watchdog", _fake_watchdog)
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await asyncio.wait_for(sink.run(), timeout=5.0)
+    assert any("simulated sink stall" in str(exc) for exc in exc_info.value.exceptions)

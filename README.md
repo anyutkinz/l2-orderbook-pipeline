@@ -13,8 +13,9 @@ process down; and it's observable end-to-end via Prometheus/Grafana.
 Every claim in this README is backed by a real run: see
 [BENCHMARKS.md](BENCHMARKS.md) for the numbers and
 [DECISIONS.md](DECISIONS.md) for the reasoning behind every non-obvious
-choice, including three real bugs this project's own verification
-process caught.
+choice, including five real bugs this project's own verification
+process caught, most recently a production livelock found during a
+live multi-hour soak run.
 
 ## Architecture
 
@@ -92,11 +93,16 @@ Each one line, with the full reasoning linked:
   (one monotonic clock, honestly precise) vs. `feed_lag` (cross-clock,
   explicitly labeled approximate in its own metric text).
   [details](DECISIONS.md#two-latency-concepts-never-conflated)
-- **Three real bugs found by this project's own verification discipline**,
-  not by luck: an off-by-one at M1, a Hypothesis-found race at M2, and
-  (the newest) a Hive-partition/schema bug at M7 that 92 passing tests
-  didn't catch but one manual pandas check did.
-  [details](DECISIONS.md#m7-benchmark-report-stress-test-readme)
+- **Five real bugs found by this project's own verification discipline**,
+  not by luck: an off-by-one at M1, a Hypothesis-found race at M2, two at
+  M7 (a Hive-partition/schema bug that 92 passing tests didn't catch but
+  one manual pandas check did, and a monotonic-vs-epoch timestamp bug the
+  stress test itself caught), and (the newest) a `ParquetSink` stall
+  livelock found live during a multi-hour unattended soak run, where a
+  queue kept filling and silently dropping rows for hours with no
+  exception ever raised.
+  [details](DECISIONS.md#m7-benchmark-report-stress-test-readme) /
+  [M8 livelock](DECISIONS.md#m8-parquetsink-stall-livelock-production-incident)
 
 ## Fault tolerance
 

@@ -1272,3 +1272,116 @@ real-clock conditions surfaced them. This is the concrete argument for
 why A3/A4-style manual verification stays a required part of the process
 even at 91+ passing tests, not a formality.
 
+## M8: ParquetSink stall livelock (production incident)
+
+### Symptom, observed live during a multi-hour unattended soak run
+
+`queue_depth` pegged at `queue_maxsize` (10000) and stayed there;
+`rows_written`/`batches_flushed` froze at the exact same values for the
+rest of the run (hours); `rows_dropped` climbed at the same rate
+`messages_received` climbed on both feeds. Both `FeedSupervisor`
+`feed_states` stayed `"running"` the entire time, no `"sink crashed"`
+log line ever appeared, and the process never shut down on its own. The
+freeze began immediately after a long gap in the terminal log consistent
+with the host machine suspending (a multi-hour jump in wall-clock
+timestamps between consecutive log lines, followed by DNS resolution
+failures typical of a network interface resuming from sleep).
+
+### Root cause: `asyncio.wait_for(timeout<=0)` never runs the wrapped coroutine
+
+`ParquetSink.run()`'s loop computed
+`remaining = flush_interval - (clock() - last_flush)` and passed
+`max(remaining, 0.0)` as `wait_for`'s timeout. `asyncio.wait_for` with a
+timeout `<= 0` wraps the coroutine via `ensure_future()` (which always
+defers actual execution to the next event-loop tick, never runs
+synchronously inline) and, if it isn't already done, cancels it and
+raises `TimeoutError` immediately, without ever letting it run, even if
+the underlying queue already has rows waiting. Because the buffer was
+still empty at that call (nothing had been appended yet), `last_flush`
+was never updated afterward either, so on every subsequent loop
+iteration `remaining` stayed negative forever: a permanent livelock. The
+event loop itself was never blocked (each iteration still yields via
+task creation/cancellation), which is why feed clients kept working
+normally throughout, and no exception was ever raised, which is why
+`FeedSupervisor._run_sink()`'s existing crash handler (log + trigger
+`request_shutdown()`, see M5) never fired: that handler correctly
+catches a sink that *raises*, but a sink that hangs without raising is
+invisible to it.
+
+Confirmed directly, not just theorized: a regression test
+(`test_p7_consume_recovers_after_a_stall_instead_of_livelocking`)
+reproduces the exact precondition, a large clock jump between `run()`
+setting `last_flush` and `_consume()`'s first iteration with a row
+already queued, and fails against the original code (verified by
+temporarily reverting the fix and re-running the test before restoring
+it) while passing against the fix.
+
+### Fix: never hand `wait_for` a non-positive timeout
+
+Whenever `remaining <= 0`, `_consume()` now flushes any buffered rows
+immediately (buffer or not) and resets `last_flush` right there, before
+computing a timeout, so the next `wait_for` call always gets a fresh,
+strictly positive window and `queue.get()` is guaranteed an actual
+chance to run. This closes the livelock at its exact mechanism rather
+than working around a symptom.
+
+### Defense in depth: a stall watchdog, independent of the fix above
+
+Per the same reasoning as M3's message-based watchdog ("don't rely on an
+emergent property when an explicit one is one method call away"),
+`ParquetSink.run()` now runs `_consume()` and a new `_watchdog()` as
+`asyncio.TaskGroup` siblings, sharing fate (either one failing tears
+down `run()` as a unit). `_watchdog()` tracks `_last_progress_at`
+(updated whenever a row is actually pulled off the queue or a batch is
+flushed) and raises if the queue is non-empty and no progress has
+happened for `stall_timeout_seconds` (default 60s). A merely-idle,
+empty queue is never treated as a stall, only a backed-up one with
+nothing draining it.
+
+`TaskGroup` (not `FeedSupervisor`) is the right tool here specifically
+because `_consume()` and its own watchdog *should* share fate, the
+opposite of M5's reasoning for why `FeedSupervisor` deliberately avoids
+`TaskGroup` at the top level (there, independent feeds must NOT share
+fate). Same library feature, applied at the scope its semantics actually
+fit.
+
+Because the watchdog raises rather than silently logging, the exception
+propagates out of `run()` to `FeedSupervisor._run_sink()`'s *existing*
+`except Exception:` handler unchanged, no changes needed there: a sink
+hang is exactly the process-critical failure that path already exists to
+catch, it simply never fired for a hang that raised nothing before now.
+
+**Ruled out, not just assumed**: a swallowed exception (`_run_sink`'s
+exception handling was re-read and is correct: it logs and triggers
+shutdown for anything raised; nothing was ever raised, confirmed by the
+total absence of a `"sink crashed"` log line across the entire multi-hour
+freeze) and a disk-space edge case (the run's own recorded free space at
+investigation time was low but nonzero, and the freeze's exact
+onset, correlated with the sleep/resume gap and matching the livelock
+mechanism byte-for-byte, is sufficient explanation without invoking disk
+pressure).
+
+**Known residual limitation, stated plainly**: `_watchdog()` is a
+cooperative asyncio task on the same event loop as `_consume()`. If a
+future change made `_flush()` (specifically `pq.ParquetWriter.write_table()`
+or `Path.replace()`) block synchronously on a genuinely stalled disk
+instead of returning promptly, that would freeze the entire event loop,
+including the watchdog itself, since single-threaded asyncio cannot
+preempt a synchronous call. The watchdog added here catches this
+incident's actual failure mode (a livelock that keeps yielding to the
+loop) and any future regression of the same shape, but a truly blocking
+I/O hang would need `_flush()` moved onto a separate thread via
+`loop.run_in_executor()` to remain detectable, which is real added
+complexity deliberately not taken on without evidence it is needed.
+
+### Test evidence
+
+`tests/unit/test_parquet_sink.py`, 4 new tests (P7): the livelock
+reproduction above; the watchdog raising on a genuine stall; the
+watchdog *not* raising on legitimate idle emptiness (guarding against
+false-positive shutdowns); and `run()` propagating a child task's
+failure end-to-end via `TaskGroup` (verified with a monkeypatched
+watchdog for a fast, deterministic trigger, independent of the timing-
+sensitive livelock reproduction). Full suite: 97 tests (93 before this
+milestone + 4 new), `mypy --strict` clean, `ruff` clean.
+
