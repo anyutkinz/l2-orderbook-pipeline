@@ -1,17 +1,16 @@
 # l2-pipeline
 
-[![CI](https://github.com/anyutkinz/l2-orderbook-pipeline/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/anyutkinz/l2-orderbook-pipeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A multi-exchange L2 order book ingestion and reconstruction pipeline —
+A multi-exchange L2 order book ingestion and reconstruction pipeline,
 built the way a real market-data system would be built, not a demo
 script. It follows each exchange's official synchronization protocol
 behind a generalized, exchange-agnostic sync contract; its recovery
 logic was proven correct with a deterministic fault-injection harness
 *before* it was ever pointed at a real exchange; it isolates a single
 feed's failure from the rest of the pipeline instead of taking the whole
-process down; and it's observable end-to-end via Prometheus/Grafana, with
-every claim in this README backed by a real run — see
+process down; and it's observable end-to-end via Prometheus/Grafana.
+Every claim in this README is backed by a real run: see
 [BENCHMARKS.md](BENCHMARKS.md) for the numbers and
 [DECISIONS.md](DECISIONS.md) for the reasoning behind every non-obvious
 choice, including three real bugs this project's own verification
@@ -49,13 +48,13 @@ flowchart LR
 
 Each feed client speaks its exchange's own WS/REST protocol and feeds a
 **pure, exchange-agnostic** book engine through a generalized `prev_id`/
-`final_id` sync contract — the same engine code runs unmodified for both
+`final_id` sync contract. The same engine code runs unmodified for both
 exchanges (verified via `git diff --stat` showing zero changes to
 `book/`, `feeds/connection.py`, or `feeds/ratelimit.py` across the entire
 OKX-integration milestone). Both feeds push into one shared, bounded
-queue drained by a single Parquet sink; a `FeedSupervisor` — not
+queue drained by a single Parquet sink. A `FeedSupervisor` (not
 `asyncio.TaskGroup`, which would cancel every feed the instant one
-crashes — owns all of it, restarting a crashed feed with jittered backoff
+crashes) owns all of it, restarting a crashed feed with jittered backoff
 while leaving its sibling and the sink untouched, and treating a sink
 crash as the one condition that triggers full graceful shutdown.
 
@@ -64,28 +63,28 @@ crash as the one condition that triggers full graceful shutdown.
 Each one line, with the full reasoning linked:
 
 - **Generalized `prev_id`/`final_id` sync contract**, not exchange-native
-  field names — lets one `BookEngine` handle Binance's contiguous-partition
+  field names: lets one `BookEngine` handle Binance's contiguous-partition
   sequencing and OKX's chain-by-equality sequencing without knowing which.
   [details](DECISIONS.md#diffeventprev_id--final_id-not-binances-raw-u--u)
-- **Deterministic fault-injection harness (DST lineage)** validates gap/
-  duplicate/reorder/disconnect/stale-snapshot recovery against an oracle
-  book *before* any real exchange is touched, and stays reproducible byte-
-  for-byte from a single seed.
-  [details](DECISIONS.md#m2--deterministic-simulation--fault-injection)
+- **Deterministic fault-injection harness (DST lineage)** validates gap,
+  duplicate, reorder, disconnect, and stale-snapshot recovery against an
+  oracle book *before* any real exchange is touched, and stays
+  reproducible byte for byte from a single seed.
+  [details](DECISIONS.md#m2-deterministic-simulation--fault-injection)
 - **Zero-line-diff proof**: adding OKX (M4) touched no line of `book/`,
-  `connection.py`, or `ratelimit.py` — the exchange-agnostic design either
+  `connection.py`, or `ratelimit.py`. The exchange-agnostic design either
   holds under a second real protocol or it doesn't, and it did.
   [details](DECISIONS.md#the-architecture-validation-property-stated-and-verified)
-- **`FeedSupervisor`, not `asyncio.TaskGroup`** — `TaskGroup` cancels every
+- **`FeedSupervisor`, not `asyncio.TaskGroup`**: `TaskGroup` cancels every
   sibling task the instant one raises, the opposite of the per-feed
   isolation a multi-exchange pipeline needs.
   [details](DECISIONS.md#feedsupervisor-not-asynciotaskgroup)
-- **Checkpoint-interval Parquet finalization**, not hourly-only — bounds
+- **Checkpoint-interval Parquet finalization**, not hourly-only: bounds
   an ungraceful crash's data loss to one checkpoint interval (5 min
   default) instead of up to a full hour.
   [details](DECISIONS.md#the-finalization-gap-from-up-to-an-hour-to-at-most-one-checkpoint-interval)
-- **Metrics via a scrape-time `Collector`**, not duplicated instrumentation
-  — `get_stats()` stays the single source of truth; the only hot-path
+- **Metrics via a scrape-time `Collector`**, not duplicated instrumentation:
+  `get_stats()` stays the single source of truth. The only hot-path
   metrics calls are the two that genuinely can't be reconstructed after
   the fact (processing latency, feed lag).
   [details](DECISIONS.md#pipelinecollector-read-get_stats-at-scrape-time-dont-double-instrument)
@@ -94,10 +93,10 @@ Each one line, with the full reasoning linked:
   explicitly labeled approximate in its own metric text).
   [details](DECISIONS.md#two-latency-concepts-never-conflated)
 - **Three real bugs found by this project's own verification discipline**,
-  not by luck — an off-by-one at M1, a Hypothesis-found race at M2, and
+  not by luck: an off-by-one at M1, a Hypothesis-found race at M2, and
   (the newest) a Hive-partition/schema bug at M7 that 92 passing tests
   didn't catch but one manual pandas check did.
-  [details](DECISIONS.md#m7--benchmark-report-stress-test-readme)
+  [details](DECISIONS.md#m7-benchmark-report-stress-test-readme)
 
 ## Fault tolerance
 
@@ -112,7 +111,7 @@ Each one line, with the full reasoning linked:
 | Delayed/stale snapshot | Straddle-condition check on `load_snapshot()` (`SNAPSHOT_STALE`) | Bounded retry against a fresh snapshot | S7 |
 | Multiple simultaneous faults | All of the above, at once | All of the above, at once | S8: 1,281 faults fired across 5,000 steps, **657/657 recoveries, zero unrecovered divergences** |
 | A single feed crashing | N/A (process-level) | `FeedSupervisor` restarts with jittered backoff; sibling feed and sink untouched | P4 |
-| The sink crashing | N/A (process-level) | Treated as process-critical — full graceful shutdown, not silently dropped rows | P5 |
+| The sink crashing | N/A (process-level) | Treated as process-critical: full graceful shutdown, not silently dropped rows | P5 |
 
 Every scenario above (S1-S8) is byte-for-byte reproducible from a single
 seed (D1).
@@ -125,20 +124,20 @@ Full methodology, all raw numbers, and honest limitations in
 - **24-hour continuous live Binance soak run**, unattended: connected/live
   book state maintained throughout, any real disconnects encountered
   auto-recovered without intervention, ended in a clean Ctrl+C graceful
-  shutdown — one of the strongest pieces of live evidence in the project,
+  shutdown. One of the strongest pieces of live evidence in the project,
   since it's the one claim no synthetic test can stand in for.
 - **No drop-based throughput ceiling found** for the queue/sink path from
   500 to 32,000 synthetic msg/sec (zero rows dropped anywhere in that
-  range) — real production traffic runs at ~18 msg/sec combined, roughly
-  three orders of magnitude below the tested range.
+  range), with real production traffic running at ~18 msg/sec combined,
+  roughly three orders of magnitude below the tested range.
 - **Processing latency p50/p95 ≈ 25µs / 48µs** on live Binance and OKX
   traffic, consistent with the synthetic benchmark's own steady-state
   figures.
 - **One profiling-justified optimization** (a 1.63x speedup in Parquet
-  row serialization, verified in isolation) — reported honestly alongside
-  the finding that it didn't move the end-to-end number, because the
-  actual bottleneck at that plateau was scheduling overhead, not the
-  function that got faster.
+  row serialization, verified in isolation), reported honestly alongside
+  the finding that it didn't move the end-to-end number: the actual
+  bottleneck at that plateau was scheduling overhead, not the function
+  that got faster.
 - **Fault-storm recovery: 657/657**, zero unrecovered divergences, fully
   reproducible from one seed.
 - **Live Parquet correctness verified on real data**: 49,929 rows across
@@ -150,7 +149,7 @@ Full methodology, all raw numbers, and honest limitations in
 ![Grafana dashboard showing live dual-feed traffic](docs/screenshots/grafana-dashboard.png)
 
 Cold-start sync from a real run (the same code path a mid-session gap
-recovery takes — `load_snapshot()` doesn't know or care whether it's
+recovery takes: `load_snapshot()` doesn't know or care whether it's
 being called at startup or after a detected gap). Not a mid-session
 incident: no `GAP_DETECTED` appears in any saved soak-run log on hand,
 so this is shown as what it actually is rather than relabeled as
@@ -165,7 +164,7 @@ RESYNC_COMPLETED, okx, BTC-USDT
 
 ### Requirements
 
-- Python 3.12 (pinned — see [DECISIONS.md](DECISIONS.md)). If your system
+- Python 3.12 (pinned, see [DECISIONS.md](DECISIONS.md)). If your system
   Python is a different version, install 3.12 separately (e.g. via the
   `py` launcher on Windows, or [pyenv](https://github.com/pyenv/pyenv) on
   macOS/Linux) and point `uv` at it: `uv venv --python 3.12`.
@@ -186,7 +185,7 @@ uv sync
 uv run python -m l2_pipeline.app --config config/default.yaml
 ```
 
-Config lives in `config/default.yaml` — exchanges/symbols, book depth,
+Config lives in `config/default.yaml`: exchanges/symbols, book depth,
 Parquet output directory and queue sizing, and the metrics port. Parquet
 output is Hive-partitioned under `output.parquet_dir`
 (`exchange=.../symbol=.../date=.../hour=.../part-*.parquet`), readable
@@ -199,7 +198,7 @@ aware reader.
 docker compose -f ops/docker-compose.yml up
 ```
 
-One command, zero manual clicking — the Prometheus scrape config and the
+One command, zero manual clicking: the Prometheus scrape config and the
 Grafana datasource + dashboard are all provisioned automatically from
 committed files under `ops/`. Grafana is at `http://localhost:3000`
 (anonymous viewer access enabled), Prometheus at `http://localhost:9090`.
@@ -214,7 +213,11 @@ uv run mypy          # type checking (strict mode)
 uv run ruff check .  # linting
 ```
 
-CI (`.github/workflows/ci.yml`) runs all three on every push/PR.
+CI is configured (`.github/workflows/ci.yml` runs all three commands
+above on every push/PR) but not currently executing, due to an
+account-level GitHub Actions restriction unrelated to this codebase. Run
+the three commands above locally to get the same results CI would
+report.
 
 ### Regenerating the benchmark report
 
@@ -223,7 +226,7 @@ uv run python scripts/stress_replay.py
 ```
 
 Reuses the same deterministic simulation harness the correctness test
-suite is built on (fixed seed, fully reproducible) — see
+suite is built on (fixed seed, fully reproducible). See
 [BENCHMARKS.md](BENCHMARKS.md#methodology) for the exact command and
 what each number means.
 
@@ -252,20 +255,20 @@ ops/
 
 ## What this doesn't do
 
-- **No L3 (queue-position) data** — this reconstructs L2 (aggregated
+- **No L3 (queue-position) data**: this reconstructs L2 (aggregated
   price-level) books only.
-- **No cross-exchange logical-instrument mapping** — `BTCUSDT` (Binance)
+- **No cross-exchange logical-instrument mapping**: `BTCUSDT` (Binance)
   and `BTC-USDT` (OKX) are tracked as distinct instruments, never merged
   into one logical symbol.
-- **No alerting or remote-write** — Prometheus/Grafana here are for local
+- **No alerting or remote-write**: Prometheus/Grafana here are for local
   visibility, not a production monitoring stack. Explicitly out of scope
   for M6.
-- **Single-machine scale only** — see
+- **Single-machine scale only**. See
   [BENCHMARKS.md's Limitations](BENCHMARKS.md#limitations) for exactly
   what was and wasn't measured. Nothing here is a capacity-planning
   number for production or cloud hardware.
 - **`overflow_policy: coalesce`** is a declared-but-unimplemented config
-  placeholder — selecting it fails loudly at config load rather than
+  placeholder: selecting it fails loudly at config load rather than
   silently behaving like `drop_oldest`.
 
 ## Status

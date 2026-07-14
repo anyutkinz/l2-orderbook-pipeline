@@ -1,10 +1,10 @@
 # Decisions
 
 Running log of non-obvious architectural choices, alternatives considered,
-and why. Written for interview prep — every entry should be defensible
+and why. Written for interview prep: every entry should be defensible
 out loud.
 
-## M0 — Project skeleton, config, logging, CI
+## M0: Project skeleton, config, logging, CI
 
 ### src-layout (`src/l2_pipeline/`) instead of a flat package at repo root
 
@@ -62,9 +62,9 @@ automatically instead of retroactively.
 ### Config: YAML file parsed into frozen dataclasses, not a raw dict or Pydantic model
 
 **Alternatives considered:**
-- Raw `dict` passed around — rejected: no static typing, silent KeyErrors
+- Raw `dict` passed around, rejected: no static typing, silent KeyErrors
   at arbitrary depth in the code instead of one validation point.
-- Pydantic — rejected for now: it's a reasonable choice too, but the spec's
+- Pydantic, rejected for now: it's a reasonable choice too, but the spec's
   "no heavy frameworks" preference and the fact that the validation surface
   here is small (a handful of fields, a couple of enums) means hand-rolled
   dataclass parsing with explicit error messages is simpler and has zero
@@ -107,13 +107,13 @@ dev/debugging without code changes.
 
 ### `app.py` in M0 only loads config + logging, no feed/book wiring
 
-**Why:** M0 is scoped to "skeleton, config, logging, CI" — wiring in feed
+**Why:** M0 is scoped to "skeleton, config, logging, CI": wiring in feed
 clients or the book engine before they exist (M1+) would mean either dead
 code or fake stubs pretending to do something they don't. `main()` today
 proves the config-loading and logging plumbing works end-to-end; each later
 milestone extends it with real behavior instead of replacing placeholders.
 
-## M1 — Pure book engine
+## M1: Pure book engine
 
 ### `DiffEvent.prev_id` / `.final_id`, not Binance's raw `U` / `u`
 
@@ -127,7 +127,7 @@ the book to currently be at" and `final_id` = "checkpoint the book becomes
 after applying it" is a contract both protocols can be translated into at
 the feed-client boundary:
 - Binance spot (`U`/`u`, no `pu`): `prev_id = U - 1`, `final_id = u`.
-- Binance futures (has `pu`): `prev_id = pu` directly — no arithmetic,
+- Binance futures (has `pu`): `prev_id = pu` directly: no arithmetic,
   `pu` *is* this field. (Binance added `pu` for exactly this reason.)
 - OKX (`seqId`/`prevSeqId`): `prev_id = prevSeqId`, `final_id = seqId`.
 
@@ -138,7 +138,7 @@ debugging. The book engine itself never sees exchange-specific field names.
 **Boundary condition re-derivation:** Binance's official first-event check
 is `U <= lastUpdateId+1 <= u`. Substituting `prev_id = U - 1`:
 `prev_id + 1 <= lastUpdateId + 1 <= u` → `prev_id <= lastUpdateId < final_id`.
-This is the generalized boundary check the engine actually implements —
+This is the generalized boundary check the engine actually implements,
 confirmed algebraically equivalent to Binance's formula, not an
 approximation.
 
@@ -151,10 +151,10 @@ Keeping them separate makes the idempotency property testable directly:
 applying the same absolute-value levels twice is a no-op the second time,
 *by construction*, independent of sequencing. That property is exactly
 what makes the snapshot-boundary straddle case safe (a REST snapshot may
-already reflect part of a straddling event's effect — reapplying the full
+already reflect part of a straddling event's effect; reapplying the full
 event on top is harmless only because updates are absolute, not deltas).
 
-Note this only works as a *separate* test of `apply_levels()` — running
+Note this only works as a *separate* test of `apply_levels()`: running
 the same `DiffEvent` through `apply_event()` twice in a row is expected to
 fail the sequencing check the second time (its `prev_id` no longer equals
 the post-first-application checkpoint), which is correct: real Binance/OKX
@@ -168,20 +168,20 @@ While implementing `load_snapshot()`'s buffer replay, initially reused
 surviving buffered events, including the first one. That's wrong: the
 first survivor is validated by the *straddle* condition
 (`prev_id <= last_update_id < final_id`), which allows `prev_id` to fall
-strictly before the snapshot's checkpoint — that's the whole point of the
+strictly before the snapshot's checkpoint. That's the whole point of the
 boundary case (test 6). Running it through the strict-equality check
 would reject exactly the case it's supposed to accept.
 
 Fix: the first survivor is applied unconditionally via `apply_levels()`
 (already validated by the straddle check before this point), and only
 survivors after it go through `_apply_live()`'s strict chaining check.
-This is the off-by-one bug the milestone's test suite exists to catch —
+This is the off-by-one bug the milestone's test suite exists to catch,
 and it did, on the first test run, before any hand-inspection.
 
 ### `ApplyResult` (typed return value), not a raised exception, for gap detection
 
-**Why:** gap detection is a routine, expected condition in this domain —
-network hiccups happen regularly — not a programmer error. A typed return
+**Why:** gap detection is a routine, expected condition in this domain
+(network hiccups happen regularly), not a programmer error. A typed return
 value forces exhaustive handling at call sites via mypy; an exception is
 invisible in the type signature and encourages callers to forget to catch
 it. Raised exceptions are reserved for genuine caller-contract violations:
@@ -192,19 +192,19 @@ needed), not a protocol event.
 ### Buffer is never cleared on a rejected (stale) snapshot
 
 **Why:** `load_snapshot()` returning `SNAPSHOT_STALE` leaves `self._buffer`
-untouched — buffering keeps growing via ongoing `apply_event()` calls
+untouched: buffering keeps growing via ongoing `apply_event()` calls
 while the feed client fetches a fresh snapshot and retries. Clearing the
 buffer on a failed attempt would throw away events that a *later,
 successful* snapshot might still need to bridge the gap (test 7 exercises
 exactly this retry-and-recover path). Unbounded buffer growth under
 repeated failures is an explicit open question, deferred to M3 where the
-feed client can own a retry/backoff policy — the pure engine's job is
+feed client can own a retry/backoff policy. The pure engine's job is
 correctness given whatever it's handed, not operational timing decisions.
 
 ### Three states (`BUFFERING`, `RESYNCING`, `LIVE`), not four
 
 **Why:** a gap detected in `LIVE` transitions *instantly* to `RESYNCING`
-with the triggering event as the seed of a new buffer — there's no
+with the triggering event as the seed of a new buffer. There's no
 observable intermediate "invalid" state to model separately. `BUFFERING`
 (cold start, book has never been valid) and `RESYNCING` (book was valid,
 lost it to a gap) are kept as distinct states despite identical internal
@@ -217,20 +217,20 @@ this needs later (M6's resync counters need to know "recovering" from
 **Why:** exchanges send price/quantity as JSON strings specifically to
 avoid float precision issues on the wire. Parsing directly via
 `Decimal(raw_str)` preserves the exact value; going through `float()`
-first would throw that guarantee away for no benefit — an easy, avoidable
+first would throw that guarantee away for no benefit: an easy, avoidable
 correctness gap in a project meant to demonstrate rigor.
 
 ### Addendum (M2): `BookEngine.full_book()`
 
 Added after M1 shipped, to support the M2 differential-testing harness's
 convergence checker, which needs to compare the engine's *entire* internal
-ladder against a ground-truth oracle — `top_levels(n)` always sorts and
+ladder against a ground-truth oracle. `top_levels(n)` always sorts and
 truncates to a configured depth, so using it with an arbitrarily large `n`
 to fake a full dump would be an abuse of a method meant for "top N levels
 to persist." `full_book()` returns defensive copies of the internal bid/ask
 dicts, so callers can't mutate engine state through the returned objects.
 
-## M2 — Deterministic simulation + fault injection
+## M2: Deterministic simulation + fault injection
 
 ### Lineage: a mini deterministic-simulation-testing (DST) harness
 
@@ -238,24 +238,24 @@ The design borrows three specific patterns from FoundationDB's and
 TigerBeetle's testing methodology, scoped down to fit a single-process,
 synchronous, no-network M2 milestone:
 
-1. **Seed-based determinism** — the entire run (market dynamics, fault
+1. **Seed-based determinism**: the entire run (market dynamics, fault
    timing, fault types) is driven by one integer seed; same seed
    reproduces bit-for-bit. This is what makes a failing run replayable
    from just the seed, not from a saved event log.
-2. **Differential/model-based testing** — a ground-truth oracle (the
+2. **Differential/model-based testing**: a ground-truth oracle (the
    market simulator's own internal ladder, updated unconditionally,
    never touched by fault injection) runs alongside the real
    `BookEngine`. Correctness is bit-exact convergence of the engine to
    the oracle, not a hand-picked set of expected outputs.
 3. **Property-based exploration on top of the deterministic scenarios**
-   (Hypothesis) — searches the space of seeds/fault-configs/step-counts
+   (Hypothesis): searches the space of seeds/fault-configs/step-counts
    for a combination the hand-written scenarios (S1-S8) didn't think of.
 
 The full versions of these systems test entire distributed clusters
 under simulated network partitions, disk corruption, and clock skew,
 with a custom deterministic runtime replacing the OS scheduler. That's
 out of scope here by design: M2 is single-process, fully synchronous, no
-asyncio, no real network — determinism first, so every later milestone
+asyncio, no real network. Determinism first, so every later milestone
 (especially the real async feed clients in M3/M4) can be tested against
 this harness without the harness itself needing to be debugged under
 concurrency.
@@ -264,14 +264,14 @@ concurrency.
 
 If `MarketSimulator` and `FaultInjector` shared one `random.Random`
 instance, adding or removing any random draw in one component would
-silently shift what the other draws on the *same* seed — determinism
+silently shift what the other draws on the *same* seed. Determinism
 would hold in the narrow sense (same seed still reproduces *a* run) but
 break in the useful sense (a harmless refactor changes what every
 existing seed produces, making old bug reports unreproducible). Fix:
 `derive_seed(seed, label)` hashes `f"{seed}:{label}"` through a throwaway
 `random.Random` to produce an independent child seed per label; each
 component takes an already-derived seed and constructs its own
-`random.Random` internally — never a shared instance passed in from
+`random.Random` internally, never a shared instance passed in from
 outside. `build_simulation()` is the single place derivation happens.
 
 ### Fault precedence + shadowed-fault logging
@@ -286,14 +286,14 @@ Every fault type is still rolled independently first (not short-circuit
 evaluated), so a type that rolled true but lost to a higher-precedence
 type gets logged as `shadowed=True` rather than silently disappearing.
 Without this, a high-probability fault type could statistically starve a
-lower-precedence one in a long run and nobody would notice — the S8
+lower-precedence one in a long run and nobody would notice. The S8
 fault-storm test asserts every configured fault type actually *fired*
 at least once, and the shadowed counts make starvation visible instead
 of hidden if that assertion ever needs loosening.
 
 One simplification: while an active window is suppressing delivery, no
-other fault types are rolled *at all* that tick (not rolled-and-shadowed
-— not rolled). Window suppression already determines delivery
+other fault types are rolled *at all* that tick (not rolled-and-shadowed,
+not rolled). Window suppression already determines delivery
 unconditionally; computing "what would have happened instead" adds
 noise, not information, for those ticks. Shadowed counts reflect ticks
 where multiple ad hoc rolls genuinely competed, not ticks preempted by
@@ -302,7 +302,7 @@ an in-progress window.
 ### `@given`, not `RuleBasedStateMachine`
 
 Hypothesis's stateful testing exists for when the tool needs to
-*discover* an operation sequence by interleaving rule calls itself —
+*discover* an operation sequence by interleaving rule calls itself,
 valuable when the sequence space isn't already captured by a compact
 parameter set. Here it already is: `(seed, FaultConfig, num_steps)`
 fully determines an entire run, faults included, by construction (that's
@@ -323,19 +323,19 @@ snapshot taken *before either was applied*, then applied both at the
 end. If both sides happened to insert in the same tick, each clamp was
 correct in isolation (a new bid can't cross the *old* best ask; a new
 ask can't cross the *old* best bid) but said nothing about whether the
-two new prices crossed *each other* — and when the existing spread was
+two new prices crossed *each other*, and when the existing spread was
 at least `2 * spread_min`, they could. H1 found this within its
 configured `max_examples=200`, shrunk to seed 1615, an all-zero
 `FaultConfig` (proving it was a pure market-generation bug, unrelated to
 fault injection), 60 steps. Fix: apply each side's change immediately
 after generating it, so a same-tick second insert clamps against the
 *current* (already-updated) opposite price instead of a stale snapshot.
-This is exactly the class of bug this harness exists to catch — order
-of generation vs. order of application silently diverging — and it was
+This is exactly the class of bug this harness exists to catch (order
+of generation vs. order of application silently diverging), and it was
 caught by the property layer, not the eight hand-written scenarios,
 none of which happened to construct this specific interleaving.
 
-## M3 — Live Binance feed client
+## M3: Live Binance feed client
 
 ### `BinanceFeedClient` is the production twin of `SimulatedFeedDriver`
 
@@ -372,7 +372,7 @@ Added `BookEngine.invalidate(reason)` (M1 API extension, same pattern as
 LIVE yet) from any state, discarding book contents, checkpoint, and
 buffer. Missed events during a WS outage are near-certain, and the
 engine's own chain-check *would* probably catch it on the first event
-after reconnect anyway — but "probably" isn't good enough for a coupling
+after reconnect anyway, but "probably" isn't good enough for a coupling
 this important. Defense in depth: don't rely on an emergent property
 when an explicit one is one method call away.
 
@@ -382,10 +382,10 @@ when an explicit one is one method call away.
 "full jitter" formula from their well-known backoff blog post
 (`base=0.5s, cap=30s` here). Rejected alternatives: no jitter (a fleet of
 reconnecting clients would thunder-herd in lockstep against Binance after
-any shared outage — not a concern at N=1 client, but a bad habit to
+any shared outage, not a concern at N=1 client, but a bad habit to
 build); "equal jitter" (`cap/2 + uniform(0, min(cap, base*2**attempt)/2)`,
 AWS's more conservative alternative) trades lower minimum delay for a
-higher floor — full jitter's wider spread is the better fit for spreading
+higher floor; full jitter's wider spread is the better fit for spreading
 out reconnect load when doing this alone. `ConnectionManager` never
 sleeps itself; it returns the delay for the caller to `await`, which is
 what makes it testable with a fake clock and RNG (T1), no event loop
@@ -394,13 +394,13 @@ needed.
 ### Watchdog is message-based, not ping/pong-based
 
 Rely on the `websockets` library's built-in ping/pong for protocol-level
-keepalive (unchanged, out of our code entirely) — but that only proves
+keepalive (unchanged, out of our code entirely), but that only proves
 the *transport* is alive, not that Binance is actually sending us book
 updates. A watchdog that only checked ping/pong would miss a connection
 that's technically open but has silently stopped producing depth events
 (the specific failure mode this exists to catch). Implemented as
 `asyncio.wait_for(ws.recv(), timeout=watchdog_timeout)` around every
-receive — if `BTCUSDT@depth@100ms` (nominally an update every ~100ms)
+receive: if `BTCUSDT@depth@100ms` (nominally an update every ~100ms)
 goes quiet for `watchdog_timeout` (default 10s), we declare the
 connection dead ourselves rather than trusting the transport layer's
 opinion of its own health.
@@ -411,7 +411,7 @@ opinion of its own health.
 developers.binance.com at implementation time (not recalled from
 training data, which can be stale and the table has changed over
 Binance's API history): 5 at `limit<=100`, 25/50/250 at the higher
-tiers. We fetch at `limit=100` — 5x `book.depth_levels=20`, comfortable
+tiers. We fetch at `limit=100`: 5x `book.depth_levels=20`, comfortable
 margin, cheapest tier. Overall budget (confirmed): 6000
 REQUEST_WEIGHT/minute per IP, reported via
 `X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter)` response headers,
@@ -421,16 +421,16 @@ wrong. `capacity=10, refill_rate=0.5/sec` sizing rationale is in
 `ratelimit.py`'s module docstring, next to the verified numbers it's
 derived from.
 
-The general pattern here — token-bucket rate limiting in front of REST
+The general pattern here (token-bucket rate limiting in front of REST
 calls, respecting `Retry-After` on 429/418, logging used-weight headers
-for observability — is standard practice in production crypto feed
+for observability) is standard practice in production crypto feed
 handlers (cryptofeed, NautilusTrader, and similar open-source exchange
 connectivity libraries all implement some form of it). Citing that as
 "this is an established pattern, not something invented here," not as a
 claim of having read those codebases line-by-line in this session.
 
-`TokenBucket` itself stays fully synchronous (no `asyncio.sleep` inside)
-— it answers "how long" via `time_until_available()`, the caller in
+`TokenBucket` itself stays fully synchronous (no `asyncio.sleep` inside):
+it answers "how long" via `time_until_available()`, the caller in
 `binance.py` does the actual `await asyncio.sleep(...)`. Same reasoning
 as `ConnectionManager`: keeping the decision-making pure is what makes
 T2 testable with a fake clock and zero event loop.
@@ -442,20 +442,20 @@ T2 testable with a fake clock and zero event loop.
 protocol-level retry loop (`SNAPSHOT_STALE`/`GAP_DETECTED`, capped at 20,
 carried over from M2). Conflating them would mean a rate-limit backoff
 retry burns down the same budget meant for protocol-level staleness
-retries — two different failure classes with two different appropriate
+retries: two different failure classes with two different appropriate
 retry budgets and backoff shapes, kept structurally separate rather than
 sharing one counter that would silently mean different things depending
 on which failure mode happened to fire first.
 
-### `load_snapshot()` can return `GAP_DETECTED`, not just `SNAPSHOT_STALE` — caught before shipping in a test
+### `load_snapshot()` can return `GAP_DETECTED`, not just `SNAPSHOT_STALE`: caught before shipping in a test
 
 First draft of `_perform_resync()` treated any non-`APPLIED` result as
-"stale, retry" — but `load_snapshot()`'s buffer-replay loop can also
+"stale, retry", but `load_snapshot()`'s buffer-replay loop can also
 return `GAP_DETECTED` (the snapshot itself was accepted, but a *later*
 buffered event failed to chain during replay). That's a genuinely
 different cause than staleness, even though the recovery action (fetch a
 fresh snapshot) happens to be identical either way. Caught while
-hand-tracing the scenario T5 was about to encode — fixed to log the
+hand-tracing the scenario T5 was about to encode, fixed to log the
 correct incident type for each cause before the test could quietly bake
 in the wrong label as "expected" behavior.
 
@@ -463,12 +463,12 @@ in the wrong label as "expected" behavior.
 
 First live run against real Binance showed two `RESYNC_COMPLETED`
 incidents at startup instead of one. Root cause: the constructor
-pre-set `_resync_needed` for "cold start needs an initial sync" — but
+pre-set `_resync_needed` for "cold start needs an initial sync", but
 `run()`'s reconnect loop *already* calls `invalidate()` +
 `resync_needed.set()` unconditionally on every connection including the
 first. The pre-set let `_resync_worker` race ahead of the WS handshake:
 it grabbed an empty buffer, fetched a snapshot, and completed a trivial
-resync *before the websocket had even finished connecting* — which the
+resync *before the websocket had even finished connecting*, which the
 coupling rule then immediately discarded via `invalidate()` once the
 real connection came up, forcing a second, real resync. Not incorrect
 (no invariant violated, no bad state), but wasteful (an extra REST call
@@ -479,7 +479,7 @@ covers cold start correctly on its own.
 ### `events_buffered` in `RESYNC_COMPLETED` logs can undercount
 
 It resets when `_perform_resync()` *starts*, but the reader loop and the
-resync worker are separate coroutines — messages can buffer before the
+resync worker are separate coroutines: messages can buffer before the
 resync task is even scheduled to run, and those don't get counted. It's
 a debug-observability figure only; nothing in the apply/convergence logic
 depends on its precision, and inflating its apparent precision would be
@@ -488,7 +488,7 @@ plainly in the code rather than silently shipped as if exact.
 
 ### Windows signal handling: `add_signal_handler` with a `KeyboardInterrupt` fallback
 
-`loop.add_signal_handler()` is POSIX-only — raises `NotImplementedError`
+`loop.add_signal_handler()` is POSIX-only, raising `NotImplementedError`
 on Windows. `main()` tries it for both SIGINT and SIGTERM (works cleanly
 on Linux, where this could plausibly run in CI or on a server) and falls
 back to relying on `KeyboardInterrupt` propagating through the running
@@ -499,7 +499,7 @@ regardless of which path triggered it.
 Verified manually, not just reasoned about: git-bash/MSYS (this
 project's default shell in the agent environment) does not appear to
 attach a real Win32 console, so `GenerateConsoleCtrlEvent`-based Ctrl+C
-simulation from that shell silently did nothing — confirmed down to a
+simulation from that shell silently did nothing: confirmed down to a
 minimal `asyncio.sleep()`-only repro with no project code involved, so
 it's an environment property, not an app bug. Run manually from a real
 PowerShell console instead: Ctrl+C correctly raised `KeyboardInterrupt`,
@@ -516,8 +516,8 @@ run gives no signal to distinguish "silently healthy" from "silently
 stalled" without interrupting the process. `_heartbeat_worker()` is a
 third persistent background task (alongside `_resync_worker`), logging
 `messages_received` / `connection_state` / `book_state` at INFO level
-every `heartbeat_interval_seconds` (default 30s, configurable). Doesn't
-touch the incident-logging design — deliberately not tagged as an
+every `heartbeat_interval_seconds` (default 30s, configurable). It
+doesn't touch the incident-logging design, and is deliberately not tagged as an
 `incident` in the structured log, since it isn't one; it's a liveness
 pulse, checked in against `get_stats()`'s existing fields rather than
 adding new bookkeeping.
@@ -526,7 +526,7 @@ adding new bookkeeping.
 
 The reader loop and `_resync_worker` both call `BookEngine` methods
 concurrently without a lock, safe only because no `BookEngine` method
-contains an `await` — under asyncio's cooperative scheduling, each call
+contains an `await`: under asyncio's cooperative scheduling, each call
 runs to completion with no yield point for the event loop to interleave
 on. That argument used to live only in a comment, which nothing stops a
 future change (M4's OKX logic landing in the same `book/` package,
@@ -535,13 +535,13 @@ for instance) from silently violating. `test_book_engine_has_no_async_methods`
 M3 merely depends on and documents) enforces it mechanically: it fails
 loudly the moment any `BookEngine` method becomes a coroutine function.
 
-## M4 — OKX feed client + normalization layer
+## M4: OKX feed client + normalization layer
 
 ### The architecture-validation property, stated and verified
 
 If the exchange-agnostic design from M1-M3 is real, adding a second
 exchange should touch zero lines of `book/`, `connection.py`, or
-`ratelimit.py` — the entire diff should be a new protocol adapter plus a
+`ratelimit.py`: the entire diff should be a new protocol adapter plus a
 thin normalization layer plus tests. Verified with `git diff --stat`
 before every commit in this milestone, not just claimed: every commit
 message in this section states the exact file set touched, and
@@ -552,35 +552,35 @@ concurrency argument M3 depends on) passes unmodified throughout.
 ### `transport.py` extraction as its own commit, before any OKX code
 
 `WebSocketLike`/`WebSocketConnector` lived in `binance.py`, but they're
-generic to any websocket-based feed client -- OKX needs the exact same
+generic to any websocket-based feed client: OKX needs the exact same
 protocols. Importing them from `binance.py` would be backwards coupling
 (OKX depending on Binance's module for a concept that predates both).
 Done as a pure move in its own commit, verified zero behavior change
 (full suite green before and after, `git diff --stat` shows only a
 lift-and-shift), specifically so the refactor is reviewable in isolation
-from the feature work that depends on it -- "refactor, then feature" as
+from the feature work that depends on it: "refactor, then feature" as
 two separate diffs a reviewer can evaluate independently.
 
 `transport.py` did gain one thing later in this milestone:
 `WebSocketLike.send()`. Binance's client never sends anything
 post-connect (pure consumer of the stream), but OKX must send
-subscribe/unsubscribe/ping -- and a real websocket connection has
+subscribe/unsubscribe/ping, and a real websocket connection has
 `.send()` regardless of whether Binance's client happens to use it, so
 extending the *shared* protocol (rather than forking an OKX-only
 variant) is the accurate model. Required adding a no-op `send()` to
 Binance's own test fixture (`FakeWebSocket`) to keep satisfying the
-widened protocol -- caught immediately by mypy, not silently.
+widened protocol, caught immediately by mypy, not silently.
 
 ### Normalization: `InstrumentId` on `TimestampedEvent`
 
 A canonical `(exchange, symbol)` pairing carried on every event, so
 M5's sink sees one schema across feeds instead of inferring which
 exchange an event came from. Deliberately thin: `symbol` stays in each
-exchange's own native format (`"BTCUSDT"` vs `"BTC-USDT"`) -- no
+exchange's own native format (`"BTCUSDT"` vs `"BTC-USDT"`): no
 cross-exchange "these are the same instrument" mapping here, that's
 M5's job, not built early on spec. `binance.py` touched in exactly one
 place (constructing `TimestampedEvent` with
-`InstrumentId("binance", self._symbol)`) -- the one deliberate
+`InstrumentId("binance", self._symbol)`), the one deliberate
 exception to keeping M3 frozen, chosen over an `Optional[InstrumentId]`
 field because a half-tagged event stream would defeat the point of a
 normalization layer.
@@ -591,7 +591,7 @@ Binance's `_fetch_snapshot()` is request/response: await a REST call,
 get a `SnapshotEvent` back directly, inside a `for attempt in range(...)`
 loop in `_perform_resync()`. OKX's snapshot arrives asynchronously as a
 normal channel push, seen by the *reader loop*, not by whatever sent
-the resubscribe request -- a nested retry loop that "awaits a snapshot"
+the resubscribe request: a nested retry loop that "awaits a snapshot"
 doesn't fit that shape. **Request/response protocols get loop-driven
 retries; push protocols get event-driven ones.** `_resync_worker`
 becomes a thin trigger (wait on `resync_needed`, send one rate-limited
@@ -600,7 +600,7 @@ count; the reader loop owns applying whatever snapshot eventually
 arrives and re-triggers the worker on failure. The outer shape stays
 shared (`run()` owns `ConnectionManager` + a persistent resync worker +
 an inline reader loop, identical incident vocabulary, identical
-`get_stats()` contract) — only the retry *orchestration* differs,
+`get_stats()` contract); only the retry *orchestration* differs,
 because that's what actually fits an async-push protocol.
 
 **Retry-counter semantics, explicit and tested:**
@@ -609,20 +609,20 @@ because that's what actually fits an async-push protocol.
 `APPLIED` and on every new connection (right after `invalidate()`), and
 forces a full reconnect once it reaches `snapshot_retry_limit`. The
 double reset point (success *and* new-connection) is what guarantees no
-leakage across episodes — a resync storm at hour 3 gets a full fresh
+leakage across episodes: a resync storm at hour 3 gets a full fresh
 budget, not whatever was left over from an unrelated storm at hour 1.
 `test_retry_counter_resets_on_success_and_does_not_leak_across_episodes`
 proves this directly: episode 1 needs exactly 3 attempts (2 stale + 1
 valid) to converge, episode 2 (a later, unrelated gap) needs its own
-full 3 attempts to exhaust the limit -- if the counter had leaked,
+full 3 attempts to exhaust the limit; if the counter had leaked,
 episode 2 would exhaust in fewer.
 
 **Bug caught in review before it shipped:** `_request_resubscribe()`
 originally re-read `self._current_ws` across two separate `await`
 points (the unsubscribe send, then the subscribe send). A disconnect
 landing between them (`run()`'s `finally` clearing `self._current_ws`
-to `None`) would crash the second send with `AttributeError` on `None`
--- silently killing `_resync_worker` for the rest of the process's
+to `None`) would crash the second send with `AttributeError` on `None`,
+silently killing `_resync_worker` for the rest of the process's
 life, since nothing awaits its result. Fixed by capturing the reference
 once into a local and suppressing mid-flight failures (harmless: `run()`'s
 own reconnect handling is already covering the disconnect, and the next
@@ -630,13 +630,13 @@ connection gets a fresh snapshot for free via the normal subscribe flow
 regardless).
 
 **Bug caught by the tests failing, not by review:** 4 of the 6 new
-client tests initially failed identically -- every scenario that
+client tests initially failed identically: every scenario that
 `ws.enqueue()`d a message *after* `client.run()` was already consuming
 never saw it; `engine.last_applied_id` stayed frozen at whatever the
 cold-start snapshot set. Root cause was in the test fixture, not the
 client: `FakeOKXWebSocket.recv()` did `await asyncio.sleep(3600)` when
-its queue was empty, and Python's `asyncio.sleep` can't be woken early
--- calling `enqueue()` while `recv()` was already suspended inside that
+its queue was empty, and Python's `asyncio.sleep` can't be woken early:
+calling `enqueue()` while `recv()` was already suspended inside that
 sleep just appended to a list nothing was watching. Binance's fixtures
 never hit this because every scripted message was queued *before*
 `client.run()` started; this was the first test that needed to inject a
@@ -644,7 +644,7 @@ message into an already-running client. Fixed by waiting on an
 `asyncio.Event` instead of a fixed sleep, set by `enqueue()`, `send()`'s
 queued responses, and `close()`. Worth keeping as a reminder that a
 fake's own concurrency model needs the same scrutiny as production
-code -- a bug in the harness produces the exact same symptom as a bug
+code: a bug in the harness produces the exact same symptom as a bug
 in the thing it's testing.
 
 ### Keepalive: two private `_receive_message()` methods, no shared `Protocol`
@@ -653,15 +653,15 @@ Binance's watchdog is one `asyncio.wait_for(ws.recv(), timeout=...)`
 call. OKX's is a two-stage dance (silence → send text `"ping"` → a
 second silence window → dead). Considered a shared `KeepaliveStrategy`
 Protocol both clients would implement; rejected for two exchanges with
-this little actually-shared logic — rule of three, don't abstract for
+this little actually-shared logic: rule of three, don't abstract for
 two cases. Each client owns a private method with the same name and
 role, zero shared code, called from that client's own reader loop.
-**Revisit this if a third exchange needs a third keepalive shape** —
+**Revisit this if a third exchange needs a third keepalive shape**:
 that's the concrete trigger for extracting a real abstraction, not a
 hypothetical future-proofing exercise now.
 
 The `"pong"` check happens on the raw string, before any `json.loads`
-call, so a pong can never surface as a false `MALFORMED_MESSAGE` — same
+call, so a pong can never surface as a false `MALFORMED_MESSAGE`, the same
 reasoning as Binance's malformed-message handling, applied one layer
 earlier here because OKX's liveness signal is itself a non-JSON payload.
 
@@ -683,12 +683,12 @@ against `developers.okx.com`, not recalled from training data.
 - **Connection attempts**: `capacity=3, refill=3/sec`, matching the
   documented per-IP limit directly. Worth having despite
   `ConnectionManager`'s backoff already making rapid reconnects
-  unlikely in practice — the documented limit is a hard ceiling, not a
+  unlikely in practice: the documented limit is a hard ceiling, not a
   suggestion, and `base_seconds=0.5` alone doesn't guarantee staying
   under it in a pathological instant-fail-instant-retry sequence.
 
 Both reuse the exact `TokenBucket` class from M3 with different
-constructor arguments — no modification to `ratelimit.py` (confirmed by
+constructor arguments; no modification to `ratelimit.py` (confirmed by
 `git diff --stat` showing it untouched across every M4 commit).
 
 ### Service notice routed through the standard reconnect path via a local exception
@@ -698,7 +698,7 @@ maintenance disconnects. Detected in the reader loop, logs
 `OKX_SERVICE_NOTICE`, then raises a local `_ServiceNoticeReconnect` so
 `run()`'s except chain routes it through the *same* `disconnected()` →
 backoff → reconnect path as any other disconnect (mirrors how a
-`TimeoutError` signals a watchdog trip) — but skips logging a redundant
+`TimeoutError` signals a watchdog trip), but skips logging a redundant
 `WS_DISCONNECTED` for the same event, since the notice already explains
 why. Kept the same jittered backoff rather than an immediate retry:
 if OKX is notifying broadly ahead of planned maintenance, other clients
@@ -737,7 +737,7 @@ memory (same standard as the Binance fixtures, provenance notes in
   Pinned with its own named regression test (U7), not just incidental
   coverage inside the normal-update parsing test.
 - **Specifically verified per the spec's request**: `prevSeqId == -1`
-  on the snapshot message — confirmed live, a sentinel, not a real
+  on the snapshot message, confirmed live as a sentinel, not a real
   predecessor. Confirmed irrelevant too: `SnapshotEvent` has no
   `prev_id` field, so the sentinel is never consumed regardless of its
   value.
@@ -745,7 +745,7 @@ memory (same standard as the Binance fixtures, provenance notes in
   no-change pushes" for the incremental `books` channel specifically
   (found this documented for the snapshot-style `books5`/`bbo-tbt`
   channels, not `books`). Noted instead that the generic chaining check
-  handles this correctly by construction even if it occurs — a message
+  handles this correctly by construction even if it occurs: a message
   where `final_id == prev_id` still passes `prev_id == last_applied_id`
   and just re-sets the checkpoint to the same value, no special-casing
   needed either way.
@@ -774,29 +774,29 @@ side lives in `binance.py` (or was already there since M3); `book/`,
 `connection.py`, `ratelimit.py` appear in neither column, by design and
 by `git diff --stat`.
 
-## M5 — Multi-feed concurrency + Parquet sink
+## M5: Multi-feed concurrency + Parquet sink
 
 ### Row format: one self-contained top-N snapshot per Parquet row
 
 Each `SnapshotRow` is a full top-`depth_levels` book snapshot (flat,
 per-level interleaved `{side}_price_{i}`/`{side}_qty_{i}` columns), written
-event-driven on every `ApplyStatus.APPLIED` result — not a delta row that
+event-driven on every `ApplyStatus.APPLIED` result, not a delta row that
 depends on the row before it. Lineage: Tardis.dev's `book_snapshot` format
 and NautilusTrader's Parquet catalog both use this shape for the same
-reason we need it here — a delta-row format is more compact, but losing
+reason we need it here: a delta-row format is more compact, but losing
 one delta row (queue overflow, a crash mid-batch) corrupts every row after
 it until the next full resync, whereas losing a self-contained snapshot
 row just reduces sampling density at that instant. Given `BoundedRowQueue`
 already has a real drop policy (below), "a drop is safe by construction"
 was worth the extra bytes per row.
 
-`bids`/`asks` come from `engine.top_levels()` called with no explicit `n`
-— it defaults to the depth the engine was already constructed with, not a
+`bids`/`asks` come from `engine.top_levels()` called with no explicit `n`:
+it defaults to the depth the engine was already constructed with, not a
 second, independently-specified depth at the sink layer. Thin sides pad
 with **null, not zero**: a zero-quantity level looks like a real level
 that happens to have no size (and `apply_levels()` in `book/engine.py`
-already uses zero-qty as its own "delete this level" sentinel on the wire)
-— reusing it for "no level exists here" would make a thin book
+already uses zero-qty as its own "delete this level" sentinel on the wire),
+reusing it for "no level exists here" would make a thin book
 indistinguishable from a deleted one downstream. `build_schema()` pads
 explicitly with `None` (P1 asserts this directly, not just that the
 present levels round-trip correctly).
@@ -806,26 +806,26 @@ present levels round-trip correctly).
 Matches the decimal precision actually observed on the wire (Binance and
 OKX both send `qty` strings with 8 decimal places in the golden fixtures
 captured back in M3/M4, e.g. `"0.11117000"`) rather than an arbitrarily
-chosen scale. `float` was never a candidate — `Decimal` is already the
+chosen scale. `float` was never a candidate: `Decimal` is already the
 type used everywhere upstream (`PriceLevel`, `book/engine.py`), so writing
 `float` to the sink would silently reintroduce the exact rounding-error
 class the rest of the pipeline was built to avoid. `string` would preserve
 precision too but forces every downstream reader (pandas, DuckDB, a
-backtester) to parse before it can do arithmetic — `decimal128` is exact
+backtester) to parse before it can do arithmetic: `decimal128` is exact
 *and* directly usable. Verified byte-exact via round-trip (P1): write a
 table with realistic 8-decimal prices, read it back, assert the `Decimal`
-values compare equal — not merely assumed to be lossless because pyarrow
+values compare equal, not merely assumed to be lossless because pyarrow
 documents it that way.
 
 ### Sink architecture: one `ParquetSink`, one `BoundedRowQueue`, `drop_oldest`
 
 A single sink task, fed by one bounded `asyncio.Queue` shared by every
 feed client. Feed clients call `BoundedRowQueue.put()`, which is fully
-synchronous — never awaits, never touches disk — so a slow or stalled
+synchronous (never awaits, never touches disk), so a slow or stalled
 sink can never backpressure the reader loop that's parsing live exchange
 messages. On overflow it evicts the oldest queued row before enqueueing
 the new one (`overflow_policy: drop_oldest`, the only variant actually
-implemented — see below), incrementing a `rows_dropped` counter surfaced
+implemented, see below), incrementing a `rows_dropped` counter surfaced
 in both `get_stats()` and the new pipeline-wide heartbeat. This is the
 first real logic behind the `OverflowPolicy` enum M0 only stubbed out;
 `COALESCE` stays declared-but-unimplemented, and `config.py` now rejects
@@ -835,7 +835,7 @@ instead of silently behaving like `drop_oldest` if someone selects it.
 P3 proves the backpressure guarantee two ways: `put()` on a full queue of
 5 synchronous calls completes in well under the sanity bound with no
 consumer ever draining (standing in for an arbitrarily slow/stalled
-sink — no separate async consumer task is needed to prove this, since
+sink, no separate async consumer task is needed to prove this, since
 `put()`'s latency is independent of `get()` by construction), and the
 surviving rows after eviction are the newest 3, in FIFO order.
 
@@ -844,30 +844,30 @@ surviving rows after eviction are the newest 3, in FIFO order.
 The original design only finalized `.tmp → final` (via `Path.replace()`)
 at hour rotation or graceful shutdown. An ungraceful crash (`kill -9`,
 power loss, OOM) landing mid-hour would leave the entire hour's data in an
-orphaned, non-Hive-visible `.tmp` file — up to ~1 hour of buffered data
+orphaned, non-Hive-visible `.tmp` file: up to ~1 hour of buffered data
 lost with no declared recovery path. Flagged explicitly rather than
 shipped silently.
 
 Chose **checkpoint-based finalization** (`_RotatingWriter` finalizes at
-the hour boundary *or* every `checkpoint_interval_seconds` — 5 minutes by
-default — whichever comes first, checked lazily on each incoming batch)
+the hour boundary *or* every `checkpoint_interval_seconds`, 5 minutes by
+default, whichever comes first, checked lazily on each incoming batch)
 over the two alternatives considered:
 
-- **Accept and document the full-hour gap** — simplest, but a 5-min-quant
+- **Accept and document the full-hour gap**: simplest, but a 5-min-quant
   portfolio project with an undefended hour-long data-loss window is a
   worse interview conversation than the modest complexity of fixing it.
-- **Finalize every batch** — the tightest possible bound (loses at most
+- **Finalize every batch**: the tightest possible bound (loses at most
   one `flush_interval_seconds`, i.e. a few seconds), but at the default
   `batch_size`/`flush_interval` this means a new Parquet file every few
-  seconds per `(exchange, symbol)` pair — file-count explosion that hurts
+  seconds per `(exchange, symbol)` pair, a file-count explosion that hurts
   every downstream reader (more file-open overhead, worse compression
   ratio per file, slower Hive-style glob reads) for a durability bound
   far tighter than this pipeline actually needs.
 
 5 minutes is the deliberate middle: bounds worst-case loss to a number
 small enough to defend, without fragmenting output into thousands of
-tiny files during a multi-hour run. The check itself costs nothing extra
-— it rides on `write_batch()`, which was already being called on every
+tiny files during a multi-hour run. The check itself costs nothing extra:
+it rides on `write_batch()`, which was already being called on every
 flush; there's no separate proactive timer, since during genuine silence
 there's nothing new at risk to checkpoint anyway. `Path.replace()`
 (atomic cross-platform, unlike bare `os.rename` which raises on Windows
@@ -880,13 +880,13 @@ test this decision demanded: write 3 batches with a fake clock advanced
 past `checkpoint_interval_seconds` between writes 1 and 2, then never call
 `close()` (simulating `kill -9`). Asserts exactly one finalized,
 independently-readable `part-*.parquet` file exists (checkpoint 1's data)
-and exactly one orphaned `.tmp` exists (checkpoint 2's data — at risk,
+and exactly one orphaned `.tmp` exists (checkpoint 2's data, at risk,
 but bounded, and not falsely readable as a complete file since
 `ParquetWriter.close()` was never called to write its footer).
 
 ### `FeedSupervisor`, not `asyncio.TaskGroup`
 
-`asyncio.TaskGroup` cancels every sibling task the instant one raises —
+`asyncio.TaskGroup` cancels every sibling task the instant one raises,
 exactly the opposite of what a multi-feed pipeline needs. One exchange's
 websocket hiccuping should never take the other exchange's feed down with
 it. `FeedSupervisor` gives each of the two task kinds it owns (feed tasks,
@@ -896,14 +896,14 @@ the one sink task) the failure semantics that actually fit it:
   with the same AWS full-jitter backoff formula used for reconnects
   (`full_jitter_delay`, extracted below), up to `max_restarts` within a
   rolling `restart_window_seconds` window. Exceeding the budget marks the
-  feed `PERMANENTLY_FAILED` and leaves it dead — every *other* feed and
+  feed `PERMANENTLY_FAILED` and leaves it dead; every *other* feed and
   the sink keep running, which is the entire point of not using
   `TaskGroup`. `restart_count` only increments on a crash that actually
-  leads to a restart, not on the final crash that gives up — so
+  leads to a restart, not on the final crash that gives up, so
   `max_restarts=2` means exactly 2 restarts are attempted (3 total calls
   to the factory), matching the name literally (P4).
 - **Sink failure is process-critical.** Parquet writes are the only
-  reason this process exists, so the sink is never restarted — a crash
+  reason this process exists, so the sink is never restarted: a crash
   there triggers `request_shutdown()` via the same `asyncio.Event` used
   for external shutdown requests (Ctrl+C, SIGTERM), which cancels every
   feed task and lets `ParquetSink.run()`'s `finally` block flush and
@@ -912,7 +912,7 @@ the one sink task) the failure semantics that actually fit it:
 
 P4 covers both a feed that permanently fails (isolated from its healthy
 sibling and the sink) and a feed that crashes once and then recovers
-within its restart budget — the recovered feed's state settles back to
+within its restart budget: the recovered feed's state settles back to
 `RUNNING`, not stuck in `RESTARTING`.
 
 ### `full_jitter_delay` extracted from `ConnectionManager.disconnected()`
@@ -920,7 +920,7 @@ within its restart budget — the recovered feed's state settles back to
 `ConnectionManager` already implemented `uniform(0, min(cap, base *
 2**attempt))` inline for reconnect backoff. `FeedSupervisor` needed the
 identical formula for restart backoff, but restart backoff has no
-`ConnectionManager` instance to attach to — it's keyed by feed name, not
+`ConnectionManager` instance to attach to: it's keyed by feed name, not
 by a single connection's state machine. Pulled the formula out to a
 standalone function (`full_jitter_delay(policy, attempt, rng) ->
 float`) rather than duplicating the arithmetic a second time or giving
@@ -935,7 +935,7 @@ unmodified, confirming the extraction changed nothing observable.
 Binance's `E` field and OKX's `ts` field are read where each reader loop
 already has the raw parsed `dict` in hand (`_extract_ts_exchange_ms()` in
 each client), specifically *not* folded into `parse_diff_event()` /
-`parse_book_update()` — those functions' signatures, and every test that
+`parse_book_update()`: those functions' signatures, and every test that
 already pins them, stay untouched (confirmed via `git diff` showing zero
 change to either function body). OKX's resync path gets a real exchange
 timestamp (the snapshot push's own `"ts"` field, threaded through
@@ -945,42 +945,42 @@ timestamp field at all, so its resync-completion row honestly records
 field name that implies it came from the exchange.
 
 Building a `SnapshotRow` from engine state is identical logic for both
-exchanges — not a protocol-specific divergence like the keepalive split
-in M4 — so it lives once, as `build_snapshot_row()` in `envelope.py`
+exchanges, not a protocol-specific divergence like the keepalive split
+in M4, so it lives once, as `build_snapshot_row()` in `envelope.py`
 (already the shared normalization boundary), called from both clients
 after every `ApplyStatus.APPLIED` result, whether that result came from
 `apply_event()` (steady-state diff) or `load_snapshot()` (resync
 completing). Each client holds an optional `row_queue: BoundedRowQueue |
-None` constructor parameter — `None` by default, so every existing test
-that constructs a client without one is unaffected — and calls
+None` constructor parameter (`None` by default, so every existing test
+that constructs a client without one is unaffected), and calls
 `row_queue.put(row)` directly, matching the design's "feed clients
 enqueue non-blockingly" decision literally rather than through an
 intermediate generic callback.
 
 ### Test evidence
 
-Full suite: 87 tests (74 at the end of M4 + 13 new — `test_parquet_sink.py`
+Full suite: 87 tests (74 at the end of M4 plus 13 new: `test_parquet_sink.py`
 ×6 covering P1/P2/P3, `test_supervisor.py` ×5 covering P4/P5, the P6
 end-to-end simulation test, and one new config-validation test), `mypy
 --strict` clean across 38 source files, `ruff` clean. P6
 (`test_p6_simulation_row_matches_oracle_top_n`) is the strongest single
 piece of evidence for the whole milestone: drives a *real* `BookEngine`
 through the M2 harness under an active fault mix (drops, duplicates,
-reorders, disconnects, delayed snapshots — `injector.log` is asserted
+reorders, disconnects, delayed snapshots; `injector.log` is asserted
 non-empty, so this isn't a fault-free run coasting through), builds a row
 from the converged engine state, pushes it through a *real* `ParquetSink`
-(not a mock — the actual async run loop, actual `pyarrow` write, actual
+(not a mock: the actual async run loop, actual `pyarrow` write, actual
 file finalize on shutdown), reads the file back, and compares every
 price/qty column against the M2 oracle's own top-N. Nothing in that chain
 is faked.
 
 **Handed off, not automated**: A3 (a 30-60 minute live dual-feed run
-against real Binance/OKX) is the user's own manual verification step —
+against real Binance/OKX) is the user's own manual verification step;
 this milestone's automated suite proves the pipeline's *logic*, not that
 it survives real network conditions unattended for an hour, which no
 unit test can honestly claim.
 
-## M6 — Prometheus metrics + Grafana dashboard
+## M6: Prometheus metrics + Grafana dashboard
 
 ### Two latency concepts, never conflated
 
@@ -991,16 +991,16 @@ into each other, in code or in the dashboard:
 - **Processing latency** is `monotonic_ns` at frame receipt (the existing
   `ts_local_ns` capture point) to `monotonic_ns` immediately after
   `apply_event()` returns `APPLIED`. One clock, no cross-machine
-  comparison — this is an honestly precise measurement of how long this
+  comparison: this is an honestly precise measurement of how long this
   process took to fold an update into the book. It's what the README's
   p50/p95/p99 figures come from.
 - **Feed lag** is wall-clock `time.time()` now minus the exchange's own
   event timestamp (Binance's `E`, OKX's `ts`). Two different clocks on two
-  different machines — this number is only ever as good as clock sync
+  different machines: this number is only ever as good as clock sync
   between here and the exchange, which is unverified and unverifiable
   from this side. The Gauge's own `HELP` text says so verbatim
   ("approximate; compares exchange timestamp against local wall clock;
-  subject to clock skew"), not just a code comment — the honesty has to
+  subject to clock skew"), not just a code comment: the honesty has to
   survive all the way to whoever reads the dashboard, not just whoever
   reads the source.
 
@@ -1008,12 +1008,12 @@ The interview answer for "so what latency did you actually measure?" is
 this distinction stated plainly: one number is a precise, single-clock
 measurement of this process's own cost; the other is a cross-clock,
 approximate operational signal (rising lag + flat processing latency
-means the problem is upstream, not here) — and the code and the exposed
+means the problem is upstream, not here), and the code and the exposed
 metric names make it impossible to accidentally quote one as the other.
 
 Both are observed at exactly one call site per client (the steady-state
 diff-apply branch in `_reader_loop`/`_handle_update_push`) and
-deliberately *not* at resync completion — a resync involves a network
+deliberately *not* at resync completion: a resync involves a network
 round-trip to fetch a snapshot, an entirely different, much larger
 latency shape that would pollute a histogram whose buckets are tuned for
 in-process dict mutation. Fewer call sites also means fewer places that
@@ -1027,13 +1027,13 @@ The single instrumentation rule for this milestone: **counters that
 by a `prometheus_client.Counter` sitting next to the existing one.**
 Two increment sites for the same fact is exactly the kind of drift that
 produces a dashboard quietly disagreeing with the logs during an
-incident — and M5's `get_stats()` was already the established single
+incident, and M5's `get_stats()` was already the established single
 source of truth for every feed client, the sink, and the supervisor, so
 respecting that boundary rather than re-deriving it from scratch was the
 only defensible choice.
 
 The only thing that *can't* be reconstructed after the fact is a
-per-event histogram observation — there's no `get_stats()` counter that
+per-event histogram observation: there's no `get_stats()` counter that
 tells you the shape of a latency distribution after the fact, only its
 count. That's the one and only exception: `Histogram.observe()` and
 `Gauge.set()` for the two latency metrics happen directly in the feed
@@ -1044,7 +1044,7 @@ survive until scrape time, and even then it should cost as little as
 possible there (see below).
 
 `PipelineCollector` deliberately does **not** expose every key
-`get_stats()` happens to carry — each metric it produces is named and
+`get_stats()` happens to carry: each metric it produces is named and
 fixed (`l2_messages_received_total`, `l2_gaps_detected_total`,
 `l2_ws_reconnects_total`, `l2_watchdog_trips_total`,
 `l2_resyncs_completed_total`, `l2_feed_restarts_total`, plus the
@@ -1054,12 +1054,12 @@ was considered and rejected: it would let cardinality grow silently every
 time a future incident counter gets added to a feed client, which
 contradicts the fixed-and-small cardinality promise below. The cost is
 that a new incident type needing its own panel requires a
-`metrics.py` change too — an acceptable, explicit tradeoff.
+`metrics.py` change too, an acceptable, explicit tradeoff.
 
 ### Cardinality: `exchange`/`symbol` plus one closed enum, nothing dynamic
 
 Every per-feed metric is labeled by exactly `exchange` and `symbol`,
-both drawn from config, both fixed at process startup — never a
+both drawn from config, both fixed at process startup, never a
 user-controlled or unbounded value. `l2_feed_state` adds one more label,
 but its four possible values are `FeedSupervisor.FeedState`'s own closed
 Python enum, not open-ended, using `StateSetMetricFamily`'s "one series
@@ -1070,7 +1070,7 @@ build a real `PipelineCollector` plus the two hot-path metrics, observe
 for exactly the two configured `(exchange, symbol)` pairs, then scan
 *every* sample this collector and both metrics produce and assert the
 full set of `(exchange, symbol)` pairs found equals exactly the
-configured set — nothing more, nothing fewer.
+configured set, nothing more, nothing fewer.
 
 ### Histogram buckets: log-spaced, 50us-100ms, 1-2-5 per decade
 
@@ -1080,13 +1080,13 @@ buckets=(0.00005, 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005,
 ```
 
 Processing latency here is dominated by in-process dict mutation
-(`apply_levels`) and event-loop scheduling overhead, not I/O — mass is
+(`apply_levels`) and event-loop scheduling overhead, not I/O: mass is
 expected in the tens-of-microseconds range with a tail into low
 milliseconds under GC pauses or scheduling jitter. Log spacing gives even
 relative resolution across that span instead of concentrating precision
 in one order of magnitude that may not even be where the interesting
 behavior lives. `0.1` (100ms) is a deliberately generous "something is
-badly wrong" ceiling — everything worse collapses into the automatic
+badly wrong" ceiling; everything worse collapses into the automatic
 `+Inf` bucket, which is fine, since the goal at that point is detecting a
 bad tail exists, not characterizing its exact shape. Explicitly a first
 guess: retunable once A4's live run shows the real distribution.
@@ -1097,32 +1097,32 @@ Both calls are pure in-process Python/C: `observe()` walks the fixed
 11-bucket array (a linear scan, negligible at this size) and increments
 a couple of atomic counters; `set()` is a single assignment under a lock
 internal to the `Gauge`. Neither touches the network, the filesystem, or
-`asyncio` in any way — no `await`, no scheduling, no lock shared with
+`asyncio` in any way: no `await`, no scheduling, no lock shared with
 anything else in the reader loop. At Binance/OKX's real message rates
 (low hundreds/sec per feed, not millions), this is immeasurably small
 next to the JSON parsing and dict mutation already happening on the same
-code path. No benchmark was run to produce a number here — M7's job, not
-M6's — but the *reason* it's negligible is structural (no I/O, no lock
+code path. No benchmark was run to produce a number here (M7's job, not
+M6's), but the *reason* it's negligible is structural (no I/O, no lock
 contention, fixed small bucket count), not an assumption resting on a
 number nobody measured.
 
 ### Grafana as code: one `docker compose up`, zero manual clicking
 
-`ops/docker-compose.yml` runs Prometheus + Grafana only — the app itself
+`ops/docker-compose.yml` runs Prometheus + Grafana only; the app itself
 runs on the host, not in the compose stack, so Prometheus reaches it via
 `host.docker.internal:9100` (the documented route from a container to a
 host-published port on Docker Desktop). An `extra_hosts:
 host.docker.internal:host-gateway` entry is included so the same compose
 file also resolves that hostname on plain Docker Engine (e.g. Linux CI),
 even though the primary target is Docker Desktop on Windows per the
-user's environment — no host-networking mode, no Linux-only assumptions,
+user's environment: no host-networking mode, no Linux-only assumptions,
 explicit port mappings only (`9090` Prometheus, `3000` Grafana).
 
 Grafana's datasource (pinned `uid: prometheus`, pointed at
-`http://prometheus:9090` — compose's own DNS resolves the service name)
+`http://prometheus:9090`, compose's own DNS resolves the service name)
 and the dashboard JSON are both auto-provisioned from files under
 `ops/grafana/provisioning/`, committed and versioned like any other
-config — no manual "add a datasource" or "import a dashboard" click
+config: no manual "add a datasource" or "import a dashboard" click
 required after `docker compose up`. The dashboard itself
 (`ops/grafana/dashboards/l2-pipeline.json`) is one screen, six panels:
 processing latency p50/p95/p99, feed lag, messages/sec, incidents/sec
@@ -1133,7 +1133,7 @@ per-feed supervisor state.
 **Verified, not just written**: `docker compose config` (structure/mount/
 port validation, doesn't need the daemon) passes cleanly; every YAML file
 parses; the dashboard JSON parses. A genuine live `docker compose up`
-boot was **not** performed in this session — Docker Desktop's daemon
+boot was **not** performed in this session: Docker Desktop's daemon
 wasn't running in this environment, and starting it unprompted was out of
 scope. That live verification, plus the real-traffic screenshot, is
 exactly what A4 is for.
@@ -1165,13 +1165,13 @@ trend or an anomaly *while it's happening*, at a glance, without reading
 log lines at all. Removing either in favor of the other would trade away
 one of those two, for no benefit.
 
-## M7 — Benchmark report, stress test, README
+## M7: Benchmark report, stress test, README
 
 ### Bug found by hands-on verification: exchange/symbol as both a Hive partition key and an in-file column
 
 This is the third real bug this project's own verification discipline has
 caught (after M1's off-by-one, caught by its own test suite, and M2's
-Hypothesis-found `delayed_snapshot_prob` edge case) — and notably, the
+Hypothesis-found `delayed_snapshot_prob` edge case), and notably, the
 first one caught specifically by *manual* live-data verification (the
 user's own A3/A4 pandas check) rather than an automated test, which is
 exactly why that manual step was kept in the process instead of trusting
@@ -1181,18 +1181,18 @@ exactly why that manual step was kept in the process instead of trusting
 dual-feed run failed with
 `pyarrow.lib.ArrowTypeError: Unable to merge: Field exchange has
 incompatible types: string vs dictionary<values=string, indices=int32,
-ordered=0>` — not old-vs-new schema drift (the run postdated the
+ordered=0>`, not old-vs-new schema drift (the run postdated the
 `ts_wall_ns`/`schema_version=2` fix), a real correctness bug in current
 code.
 
 **Root cause, confirmed by direct reproduction**, not guessed: `exchange`
-and `symbol` were stored *twice* — once as Hive partition-directory
+and `symbol` were stored *twice*: once as Hive partition-directory
 segments (`exchange=binance/symbol=BTCUSDT/...`, required for the
 partitioned layout) and once more as plain-`string` columns inside every
 Parquet file (`build_schema()`'s original `exchange`/`symbol` fields).
 `pyarrow.parquet.read_table()` and `pandas.read_parquet()` both default to
-`partitioning='hive'` — confirmed directly from their signatures, not
-assumed — meaning they *always* reconstruct partition-key columns from
+`partitioning='hive'` (confirmed directly from their signatures, not
+assumed), meaning they *always* reconstruct partition-key columns from
 the directory path as `dictionary<values=string, indices=int32>`
 columns. Reading more than one partition together therefore always tries
 to merge two genuinely different representations of the same column name:
@@ -1206,18 +1206,18 @@ and confirmed the *opposite* case (no in-file `exchange`/`symbol`
 columns) reads back cleanly with the same default call.
 
 **Fix**: `build_schema()` no longer includes `exchange`/`symbol` as
-in-file columns at all — they exist only as Hive partition keys, which is
+in-file columns at all: they exist only as Hive partition keys, which is
 also standard Hive/Spark/Trino/DuckDB convention (never duplicate a
 partition column inside the file); the original design's redundancy was
 the actual non-standard choice, not the fix. `SnapshotRow` (the in-memory
 dataclass) keeps both fields unchanged, since `ParquetSink`/
 `_RotatingWriter` still need them to group rows and build each file's
-partition path — only the *on-disk Arrow schema* dropped them.
+partition path; only the *on-disk Arrow schema* dropped them.
 `SCHEMA_VERSION` bumped `2 -> 3`.
 
 **Regression test** (`test_p2_multi_partition_tree_reads_back_via_default_hive_reader`):
 writes across two exchanges *and* two file rotations (both conditions are
-required to reproduce it — confirmed empirically that a single partition
+required to reproduce it, confirmed empirically that a single partition
 or a single file never triggers the merge), then calls the exact
 previously-failing `pq.read_table(dir)` and asserts it succeeds with
 correct data. P1 and P6 also updated: P1 now asserts `exchange`/`symbol`
@@ -1227,7 +1227,7 @@ reconstruction) instead of a single file.
 
 **Data implication, stated directly**: schema_version=2 files (with the
 in-file columns) and schema_version=3 files (without) cannot be safely
-mixed in the same tree — combining them reintroduces essentially the same
+mixed in the same tree: combining them reintroduces essentially the same
 class of merge inconsistency, just between two different in-file
 representations across files instead of one in-file vs one path-inferred.
 Any existing collected data must be purged before recollecting under the
@@ -1240,10 +1240,10 @@ A second real bug, found by M7's own stress-replay smoke test before any
 sweep numbers were trusted: `_hour_key_for()` interpreted
 `SnapshotRow.ts_local_ns` as epoch nanoseconds, but `ts_local_ns` is
 `time.monotonic_ns()` (M3's deliberate, correct choice for latency
-measurement — immune to NTP adjustments, guaranteed non-decreasing), with
+measurement, immune to NTP adjustments, guaranteed non-decreasing), with
 an undefined, non-epoch reference point. On this machine that reference
 point sits near system boot, so every partition date/hour this pipeline
-had ever produced -- M5 onward, including any real Binance/OKX run --
+had ever produced (M5 onward, including any real Binance/OKX run)
 was silently wrong (`date=1970-01-19` instead of the real date), with no
 error raised, since a monotonic value reinterpreted as epoch time is
 still a valid-looking number.
@@ -1267,7 +1267,7 @@ technically well-typed (an `int`, a `str`) said nothing about whether it
 was being used for the *purpose* its value actually represented. Neither
 mypy nor the existing test suite could catch either one, because both
 were semantically wrong in a way indistinguishable from correct at the
-type level -- only running the real code against real multi-partition,
+type level; only running the real code against real multi-partition,
 real-clock conditions surfaced them. This is the concrete argument for
 why A3/A4-style manual verification stays a required part of the process
 even at 91+ passing tests, not a formality.
