@@ -1385,3 +1385,152 @@ watchdog for a fast, deterministic trigger, independent of the timing-
 sensitive livelock reproduction). Full suite: 97 tests (93 before this
 milestone + 4 new), `mypy --strict` clean, `ruff` clean.
 
+## M9: Binance reconnect wedge + unreachable supervisor escalation (production incident)
+
+### Symptom, observed live during the same class of multi-hour soak run as M8
+
+A second host suspend/resume gap (`soak_20260714_115958.log`, incident
+onset 2026-07-15T03:46:52), this time hitting both feeds with identical
+`gaierror: getaddrinfo failed` disconnects within the same few seconds.
+OKX recovered on its own once real connectivity returned (`WS_RECONNECTED`
+at 04:37:35, `messages_received` climbing steadily afterward). Binance
+never recovered for the rest of the log, a span of 93 minutes and
+counting at the point the log was captured: `connection_state` cycled
+`connecting` <-> `backoff` on every ~30s heartbeat, `messages_received`
+frozen at the exact same value throughout, no further `WS_RECONNECTED`
+ever logged. Both `feed_states.binance` stayed `"running"` and
+`feed_restart_counts.binance` stayed `0` the entire time -- the pipeline
+heartbeat gave no indication anything was wrong, and `rows_written`/
+`batches_flushed` kept climbing (OKX alone was enough to keep those
+counters moving), which would have made the outage easy to miss glancing
+only at the top-line heartbeat.
+
+### Root cause 1: FeedSupervisor's restart path was structurally unreachable
+
+`BinanceFeedClient.run()` and `OKXFeedClient.run()` each own a `while
+True:` loop whose `except TimeoutError` / `except Exception` handlers
+catch *every* connection failure internally and retry forever via
+`ConnectionManager`'s backoff -- by design, per M3/M4 (an isolated
+feed hiccup shouldn't need supervisor involvement). But this means
+`run()` never raises for an ordinary reconnect failure, no matter how
+many in a row. `FeedSupervisor._run_feed` (M5) can only restart a feed
+when its factory *raises* -- so a feed stuck retrying indefinitely inside
+its own loop was, and always had been, invisible to the one piece of code
+whose entire job is noticing a feed that isn't recovering.
+
+**Compounding, found in the same pass**: even if something had made
+`run()` raise, the restart would have been broken. `app.py` registered
+`client.run` -- a bound method of one already-constructed client -- as
+the supervisor's "factory". `_run_feed`'s restart calls `entry.factory()`
+again, which would replay `run()` on that *same* instance whose `finally`
+block had already closed its owned httpx client and cancelled its
+background tasks. A real restart would have crash-looped immediately,
+burning through `max_restarts` and landing the feed in
+`PERMANENTLY_FAILED` -- a strictly worse outcome than the silent wedge it
+was meant to fix.
+
+### Root cause 2: a second, independent asymmetry between the two clients
+
+`OKXFeedClient._request_resubscribe()` wraps its sends in
+`contextlib.suppress(Exception)`, with an explicit comment (M4) warning
+why: an unguarded exception there would silently kill `_resync_worker`
+for the rest of the process's life, since nothing awaits that
+fire-and-forget task's result. `BinanceFeedClient._fetch_snapshot()` had
+no equivalent guard around its `httpx` call -- a network-level failure
+fetching the REST snapshot (the same disconnect class hitting the WS
+side) would propagate unhandled through `_perform_resync()` straight out
+of `_resync_worker()`, killing it silently. Confirmed, not just
+theorized: reverting the fix and reproducing with a fake HTTP client that
+fails its first three calls then succeeds, the un-caught `OSError`
+resurfaces through `run()`'s own cleanup (`await resync_task` re-raising
+the dead task's exception) instead of the resync ever completing.
+
+`outage_duration_seconds` was also confirmed wrong by the same incident:
+OKX logged `21.2` for a `WS_RECONNECTED` whose real gap (from the first
+disconnect to the eventual reconnect) was ~50 minutes.
+`ConnectionManager.disconnected()` overwrote `_disconnected_at` on
+*every* call, not just the first disconnect of an episode -- a real
+outage is a disconnect followed by however many failed retries (each
+itself calling `disconnected()` again) before a connect finally
+succeeds, so the field was measuring only the last retry's gap.
+
+**Ruled out, not assumed**: whether Binance's WS handshake itself was
+failing for an external reason (an exchange-side throttle triggered by
+the reconnect burst, a longer-lived DNS condition specific to that
+hostname) couldn't be established from the log alone, and this review
+doesn't claim to have pinned that down -- it's plausible, and Binance's
+client, unlike OKX's, has no per-attempt connection-rate limiter (OKX's
+`_connection_bucket`, added in M4 against OKX's documented 3/sec-per-IP
+limit) to prevent hammering reconnects during exactly this kind of burst.
+That asymmetry is noted as a contributing factor, not fixed here, since
+retrofitting a new rate limit changes behavior for every reconnect, not
+just this failure mode -- out of scope for this pass. What *is* fixed,
+and doesn't depend on ever identifying the external trigger: a feed that
+can't reconnect must eventually escalate rather than retry forever
+silently, and a forced restart must actually get a clean, working
+instance when it does.
+
+### Fix: an escalation budget in ConnectionManager's consumers, a real factory in app.py
+
+Both feed clients now take a `max_consecutive_reconnect_failures`
+parameter (default 10, `DEFAULT_MAX_CONSECUTIVE_RECONNECT_FAILURES` in
+`connection.py`, shared rather than duplicated since it's the same policy
+question for both). After every `disconnected()` call, `run()` checks
+`ConnectionManager.attempt` (already tracked, already reset to 0 the
+moment a message gets through on a live connection -- so this can never
+fire for isolated disconnects sprinkled across an otherwise-healthy run,
+only a genuine unbroken run of failures) and raises a new
+`ReconnectBudgetExhausted` once the budget is exhausted, logging
+`RECONNECT_BUDGET_EXHAUSTED`. This is the one exception deliberately
+*not* swallowed by run()'s own except chain -- it propagates out of
+`run()` entirely, finally giving `FeedSupervisor._run_feed`'s existing
+restart-with-backoff logic (unchanged, unreachable until now) something
+to catch.
+
+`app.py` now builds each feed via a real factory (`_make_feed_factory`):
+every call, including restarts, constructs a brand new client instance --
+fresh `ConnectionManager`, fresh httpx client, fresh everything -- rather
+than replaying `run()` on the one that just raised. `PipelineCollector`
+needs a stats source that survives this: `FeedRegistration` now holds a
+small `_CurrentFeedClient` indirection cell (updated by the factory on
+every construction) instead of a fixed client reference, so metrics keep
+reading the *live* instance across a restart instead of a dead one's
+frozen counters.
+
+`BinanceFeedClient._fetch_snapshot()` now catches exceptions around the
+`httpx` call the same way it already handled 429/418: log
+`SNAPSHOT_FETCH_NETWORK_ERROR`, count it, and retry within the existing
+`http_retry_limit` loop -- a network failure degrades to the existing
+`HttpRetryLimitExceeded` -> `SNAPSHOT_FETCH_FAILED` path (which
+`_perform_resync` already handles by returning cleanly) instead of
+crashing `_resync_worker`.
+
+`ConnectionManager.disconnected()` now only sets `_disconnected_at` the
+first time it fires after a connection, leaving it alone on every
+subsequent retry within the same outage -- `outage_duration_seconds` now
+spans the whole episode.
+
+### Test evidence
+
+Every regression test here was confirmed against the *original* code
+first (same rigor as M8): `test_connection.py`'s new
+`test_outage_duration_spans_the_whole_episode_not_just_the_last_retry`
+fails pre-fix (asserts the full ~3000s span, gets the last retry's 21.2s)
+and passes after. `test_reconnect_escalation.py` (new file) has three
+tests -- Binance and OKX each raising `ReconnectBudgetExhausted` after a
+scripted run of always-failing connects, and an end-to-end
+`FeedSupervisor` + real `BinanceFeedClient` test proving the *fresh*
+post-restart instance (not the wedged original) is what actually
+recovers -- all three verified to fail (either a collection error, since
+`ReconnectBudgetExhausted` didn't exist yet, or a real `TimeoutError`
+from `run()` never raising) with the escalation checks reverted, and pass
+with them restored.
+`test_binance_control_loop.py`'s new
+`test_t9_network_error_on_snapshot_fetch_does_not_kill_resync_worker`
+scripts three network failures then a working response and asserts the
+resync still completes; reverted to the original unguarded `_fetch_snapshot`,
+it fails with the dead resync task's `OSError` resurfacing through
+`run()`'s own cleanup, exactly matching the failure mode this fix closes.
+Full suite: 102 tests (97 before this milestone + 5 new), `mypy --strict`
+clean, `ruff` clean.
+

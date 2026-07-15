@@ -88,6 +88,44 @@ async def test_t5_gap_scenario_converges_with_correct_incidents() -> None:
 
 
 @pytest.mark.asyncio
+async def test_t9_network_error_on_snapshot_fetch_does_not_kill_resync_worker() -> None:
+    """Regression for the M9 incident: a network-level failure fetching
+    the REST snapshot (DNS, connection reset -- the same disconnect class
+    that hits the WS side during a real outage) must be retried, not left
+    to propagate unhandled out of _fetch_snapshot() -> _perform_resync()
+    -> _resync_worker(), which would silently kill that fire-and-forget
+    task for the rest of the process's life. Scripts 3 network failures
+    then a working response: the resync must still complete."""
+    messages = [_diff_message(1, 1, [["100.00", "1.0"]], [])]
+    http_client = FakeHttpClient(
+        fail_first_n=3,
+        default=FakeHttpResponse(200, {"lastUpdateId": 0, "bids": [], "asks": []}),
+    )
+
+    engine = BookEngine(depth_levels=20)
+    client = BinanceFeedClient(
+        "BTCUSDT",
+        engine,
+        watchdog_timeout_seconds=5.0,
+        ws_connector=scripted_connector(messages),
+        http_client=http_client,
+        rng=random.Random(1),
+    )
+
+    task = asyncio.create_task(client.run())
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert engine.state is BookState.LIVE
+    stats = client.get_stats()["counters"]
+    assert stats["resync_completed"] == 1
+    assert stats["snapshot_fetch_network_error"] == 3
+    assert len(http_client.calls) == 4
+
+
+@pytest.mark.asyncio
 async def test_t5_malformed_message_is_skipped_and_logged() -> None:
     messages = [
         _diff_message(1, 1, [["100.00", "1.0"]], []),

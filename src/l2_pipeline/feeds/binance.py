@@ -17,7 +17,12 @@ from prometheus_client import Gauge, Histogram
 
 from l2_pipeline.book.engine import BookEngine
 from l2_pipeline.book.types import ApplyStatus, BookState, DiffEvent, PriceLevel, SnapshotEvent
-from l2_pipeline.feeds.connection import BackoffPolicy, ConnectionManager
+from l2_pipeline.feeds.connection import (
+    DEFAULT_MAX_CONSECUTIVE_RECONNECT_FAILURES,
+    BackoffPolicy,
+    ConnectionManager,
+    ReconnectBudgetExhausted,
+)
 from l2_pipeline.feeds.envelope import InstrumentId, TimestampedEvent, build_snapshot_row
 from l2_pipeline.feeds.ratelimit import (
     DEFAULT_SNAPSHOT_BUCKET_CAPACITY,
@@ -127,6 +132,7 @@ class BinanceFeedClient:
         http_retry_limit: int = DEFAULT_HTTP_RETRY_LIMIT,
         depth_limit: int = DEFAULT_DEPTH_LIMIT,
         heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        max_consecutive_reconnect_failures: int = DEFAULT_MAX_CONSECUTIVE_RECONNECT_FAILURES,
         backoff_policy: BackoffPolicy | None = None,
         ws_connector: WebSocketConnector | None = None,
         http_client: HttpClientLike | None = None,
@@ -144,6 +150,7 @@ class BinanceFeedClient:
         self._http_retry_limit = http_retry_limit
         self._depth_limit = depth_limit
         self._heartbeat_interval = heartbeat_interval_seconds
+        self._max_consecutive_reconnect_failures = max_consecutive_reconnect_failures
         self._row_queue = row_queue
         self._processing_latency = processing_latency
         self._feed_lag = feed_lag
@@ -189,6 +196,26 @@ class BinanceFeedClient:
             "book_state": self._engine.state.value,
             "book_last_applied_id": self._engine.last_applied_id,
         }
+
+    def _raise_if_reconnect_budget_exhausted(self) -> None:
+        """Called right after ConnectionManager.disconnected(), whose
+        `attempt` counter only resets once a message actually gets through
+        on a live connection -- so this only fires for a genuine run of
+        consecutive failures, never for isolated disconnects sprinkled
+        across an otherwise-healthy run.
+        """
+        attempt = self._connection.attempt
+        if attempt < self._max_consecutive_reconnect_failures:
+            return
+        self._log(
+            logging.ERROR,
+            "exceeded consecutive reconnect failures without a single message, "
+            "escalating to supervisor for a full restart",
+            "RECONNECT_BUDGET_EXHAUSTED",
+            consecutive_failures=attempt,
+        )
+        self._stats["reconnect_budget_exhausted"] += 1
+        raise ReconnectBudgetExhausted(f"{attempt} consecutive failed reconnect attempts")
 
     def _stream_url(self) -> str:
         stream_name = f"{self._symbol.lower()}@depth@{self._update_speed}"
@@ -238,6 +265,7 @@ class BinanceFeedClient:
                     )
                     self._stats["watchdog_tripped"] += 1
                     delay = self._connection.disconnected("watchdog_tripped")
+                    self._raise_if_reconnect_budget_exhausted()
                     await asyncio.sleep(delay)
                 except Exception as exc:
                     reason = f"{type(exc).__name__}: {exc}"
@@ -246,6 +274,7 @@ class BinanceFeedClient:
                     )
                     self._stats["ws_disconnected"] += 1
                     delay = self._connection.disconnected(reason)
+                    self._raise_if_reconnect_budget_exhausted()
                     await asyncio.sleep(delay)
                 finally:
                     self._current_ws = None
@@ -445,9 +474,33 @@ class BinanceFeedClient:
                 await asyncio.sleep(wait)
             self._token_bucket.try_acquire()
 
-            response = await self._http_client.get(
-                "/api/v3/depth", params={"symbol": self._symbol, "limit": self._depth_limit}
-            )
+            try:
+                response = await self._http_client.get(
+                    "/api/v3/depth", params={"symbol": self._symbol, "limit": self._depth_limit}
+                )
+            except Exception as exc:
+                # A network-level failure here (DNS, connection reset,
+                # timeout -- the same disconnect class that hits the WS
+                # side) is exactly as retryable as an HTTP 429 below.
+                # Letting it propagate unhandled would silently kill
+                # _resync_worker for the rest of the process's life --
+                # the same class of bug OKX's _request_resubscribe
+                # explicitly guards against with contextlib.suppress,
+                # except here it's the resync path itself, not a
+                # best-effort side send, so a bounded retry (not a
+                # blanket suppress) is the right shape: give up on this
+                # attempt, let the existing http_retry_limit loop and
+                # HttpRetryLimitExceeded -> SNAPSHOT_FETCH_FAILED path
+                # (which _perform_resync already handles by returning
+                # cleanly) absorb it instead of crashing the worker task.
+                self._log(
+                    logging.WARNING,
+                    "network error fetching snapshot, retrying",
+                    "SNAPSHOT_FETCH_NETWORK_ERROR",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                self._stats["snapshot_fetch_network_error"] += 1
+                continue
             used_weight = {
                 k: v
                 for k, v in response.headers.items()

@@ -23,7 +23,12 @@ from l2_pipeline.book.types import (
     PriceLevel,
     SnapshotEvent,
 )
-from l2_pipeline.feeds.connection import BackoffPolicy, ConnectionManager
+from l2_pipeline.feeds.connection import (
+    DEFAULT_MAX_CONSECUTIVE_RECONNECT_FAILURES,
+    BackoffPolicy,
+    ConnectionManager,
+    ReconnectBudgetExhausted,
+)
 from l2_pipeline.feeds.envelope import InstrumentId, TimestampedEvent, build_snapshot_row
 from l2_pipeline.feeds.ratelimit import TokenBucket
 from l2_pipeline.feeds.transport import WebSocketConnector, WebSocketLike
@@ -171,6 +176,7 @@ class OKXFeedClient:
         pong_timeout_seconds: float = DEFAULT_PONG_TIMEOUT_SECONDS,
         snapshot_retry_limit: int = DEFAULT_SNAPSHOT_RETRY_LIMIT,
         heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        max_consecutive_reconnect_failures: int = DEFAULT_MAX_CONSECUTIVE_RECONNECT_FAILURES,
         backoff_policy: BackoffPolicy | None = None,
         ws_connector: WebSocketConnector | None = None,
         rng: random.Random | None = None,
@@ -187,6 +193,7 @@ class OKXFeedClient:
         self._pong_timeout = pong_timeout_seconds
         self._snapshot_retry_limit = snapshot_retry_limit
         self._heartbeat_interval = heartbeat_interval_seconds
+        self._max_consecutive_reconnect_failures = max_consecutive_reconnect_failures
         self._row_queue = row_queue
         self._processing_latency = processing_latency
         self._feed_lag = feed_lag
@@ -235,6 +242,27 @@ class OKXFeedClient:
             extra={"extra_fields": {"incident": incident, "symbol": self._symbol, **fields}},
         )
 
+    def _raise_if_reconnect_budget_exhausted(self) -> None:
+        """Same escalation as BinanceFeedClient's -- see connection.py's
+        ReconnectBudgetExhausted docstring. Called after every
+        disconnected() call including the service-notice path: a proactive
+        reconnect that keeps succeeding resets `attempt` to 0 on its next
+        message same as any other reconnect, so this only fires for a
+        genuine run of consecutive failures either way.
+        """
+        attempt = self._connection.attempt
+        if attempt < self._max_consecutive_reconnect_failures:
+            return
+        self._log(
+            logging.ERROR,
+            "exceeded consecutive reconnect failures without a single message, "
+            "escalating to supervisor for a full restart",
+            "RECONNECT_BUDGET_EXHAUSTED",
+            consecutive_failures=attempt,
+        )
+        self._stats["reconnect_budget_exhausted"] += 1
+        raise ReconnectBudgetExhausted(f"{attempt} consecutive failed reconnect attempts")
+
     async def run(self) -> None:
         resync_task = asyncio.create_task(self._resync_worker())
         heartbeat_task = asyncio.create_task(self._heartbeat_worker())
@@ -273,6 +301,7 @@ class OKXFeedClient:
                     raise
                 except _ServiceNoticeReconnect:
                     delay = self._connection.disconnected("service_notice")
+                    self._raise_if_reconnect_budget_exhausted()
                     await asyncio.sleep(delay)
                 except TimeoutError:
                     self._log(
@@ -284,6 +313,7 @@ class OKXFeedClient:
                     )
                     self._stats["watchdog_tripped"] += 1
                     delay = self._connection.disconnected("watchdog_tripped")
+                    self._raise_if_reconnect_budget_exhausted()
                     await asyncio.sleep(delay)
                 except Exception as exc:
                     reason = f"{type(exc).__name__}: {exc}"
@@ -292,6 +322,7 @@ class OKXFeedClient:
                     )
                     self._stats["ws_disconnected"] += 1
                     delay = self._connection.disconnected(reason)
+                    self._raise_if_reconnect_budget_exhausted()
                     await asyncio.sleep(delay)
                 finally:
                     self._current_ws = None

@@ -5,6 +5,7 @@ import asyncio
 import logging
 import random
 import signal
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -65,6 +66,55 @@ def _build_client(
     raise ValueError(f"unsupported exchange {exchange.name!r}")
 
 
+class _CurrentFeedClient:
+    """Indirection cell so PipelineCollector keeps reading the *live*
+    client's stats across a FeedSupervisor-triggered restart. Restarting a
+    feed must build a brand new client instance (fresh ConnectionManager,
+    fresh httpx client, fresh everything) rather than re-invoking run() on
+    the one that just raised -- its own `finally` block already closed its
+    owned httpx client and tore down its background tasks, so replaying
+    run() on it would just crash again immediately. FeedRegistration holds
+    this cell instead of a fixed client reference so metrics don't keep
+    reporting a dead instance's frozen counters after a real restart.
+    """
+
+    def __init__(self) -> None:
+        self._client: _FeedClient | None = None
+
+    def set(self, client: _FeedClient) -> None:
+        self._client = client
+
+    def get_stats(self) -> dict[str, Any]:
+        if self._client is None:
+            # Matches the metrics-server-started-before-any-feed-task
+            # ordering below: a scrape landing before the first factory
+            # call gets an empty-but-valid response, not a crash.
+            return {"counters": {}, "connection_state": "unknown", "book_state": "unknown"}
+        return self._client.get_stats()
+
+
+def _make_feed_factory(
+    exchange: ExchangeConfig,
+    engine: BookEngine,
+    row_queue: BoundedRowQueue,
+    processing_latency: Histogram,
+    feed_lag: Gauge,
+    current: _CurrentFeedClient,
+) -> Callable[[], Awaitable[None]]:
+    """FeedSupervisor calls this once on startup and again on every
+    restart -- each call must construct a genuinely fresh client, which is
+    exactly what closes the escalation loop: ReconnectBudgetExhausted only
+    helps if the replacement client isn't reusing torn-down state.
+    """
+
+    async def _factory() -> None:
+        client = _build_client(exchange, engine, row_queue, processing_latency, feed_lag)
+        current.set(client)
+        await client.run()
+
+    return _factory
+
+
 async def _supervisor_heartbeat_worker(
     supervisor: FeedSupervisor,
     sink: ParquetSink,
@@ -119,9 +169,12 @@ async def _run_pipeline(config: AppConfig) -> None:
     feed_registrations: list[FeedRegistration] = []
     for exchange in config.exchanges:
         engine = BookEngine(depth_levels=config.book.depth_levels)
-        client = _build_client(exchange, engine, row_queue, processing_latency, feed_lag)
-        supervisor.add_feed(exchange.name, client.run)
-        feed_registrations.append(FeedRegistration(exchange.name, exchange.symbols[0], client))
+        current = _CurrentFeedClient()
+        supervisor.add_feed(
+            exchange.name,
+            _make_feed_factory(exchange, engine, row_queue, processing_latency, feed_lag, current),
+        )
+        feed_registrations.append(FeedRegistration(exchange.name, exchange.symbols[0], current))
 
     metrics_registry.register(PipelineCollector(feed_registrations, sink, supervisor))
     # Started before any feed task exists (supervisor.run(), below, is what

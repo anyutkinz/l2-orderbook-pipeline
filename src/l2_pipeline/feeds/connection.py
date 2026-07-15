@@ -23,6 +23,33 @@ class BackoffPolicy:
     cap_seconds: float = 30.0
 
 
+# Shared by both feed clients (not a BackoffPolicy field: this bounds how
+# many consecutive failed *reconnect attempts* a feed's own retry loop is
+# allowed to absorb silently, an orthogonal concern to the delay formula
+# between attempts). Observed live (M9): a feed's own ConnectionManager
+# backoff loop retries forever by design, and nothing outside it ever
+# notices a feed that keeps failing to reconnect -- feed_states stayed
+# "running" and restart_counts stayed 0 for 93 minutes straight. 10
+# consecutive failures is a few minutes of real wall-clock time at this
+# module's default BackoffPolicy (cap=30s), a reasonable point to stop
+# trusting the feed's own retry loop and let FeedSupervisor force a full
+# restart (fresh client instance, fresh sockets, fresh DNS) instead.
+DEFAULT_MAX_CONSECUTIVE_RECONNECT_FAILURES = 10
+
+
+class ReconnectBudgetExhausted(RuntimeError):
+    """Raised by a feed client's run() loop once its ConnectionManager has
+    failed to reconnect DEFAULT_MAX_CONSECUTIVE_RECONNECT_FAILURES times in
+    a row without a single message getting through. Deliberately lets this
+    propagate out of run() entirely (rather than swallowing it, the way
+    every other disconnect reason is handled) so FeedSupervisor's existing
+    `except Exception` restart path -- previously unreachable for ordinary
+    reconnect failures, since run() never raised for those -- finally gets
+    a chance to force a full restart instead of the feed retrying forever
+    silently.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectedInfo:
     attempt: int
@@ -85,10 +112,21 @@ class ConnectionManager:
         interpreted here -- it's for the caller's own structured logging
         (WS_DISCONNECTED vs WATCHDOG_TRIPPED etc), since a plain close, an
         error, and a watchdog trip are all the same state transition.
+
+        `_disconnected_at` is only set the *first* time this fires after a
+        connection -- a real outage is rarely one clean disconnect/connect
+        pair, it's a disconnect followed by however many failed reconnect
+        attempts (each one calling this method again) before a connect()
+        finally succeeds. Overwriting it on every retry would measure only
+        the last retry's gap instead of the whole episode (observed live:
+        a ~50-minute outage logged as a 21.2s `outage_duration_seconds`
+        because the second-to-last retry landed 21.2s before the eventual
+        reconnect).
         """
         del reason
         self._state = ConnectionState.BACKOFF
-        self._disconnected_at = self._clock()
+        if self._disconnected_at is None:
+            self._disconnected_at = self._clock()
         delay = full_jitter_delay(self._policy, self._attempt, self._rng)
         self._attempt += 1
         return delay

@@ -13,9 +13,9 @@ process down; and it's observable end-to-end via Prometheus/Grafana.
 Every claim in this README is backed by a real run: see
 [BENCHMARKS.md](BENCHMARKS.md) for the numbers and
 [DECISIONS.md](DECISIONS.md) for the reasoning behind every non-obvious
-choice, including five real bugs this project's own verification
-process caught, most recently a production livelock found during a
-live multi-hour soak run.
+choice, including six real bugs this project's own verification
+process caught, most recently a reconnect wedge and an unreachable
+supervisor-restart path found during a live multi-hour soak run.
 
 ## Architecture
 
@@ -93,16 +93,20 @@ Each one line, with the full reasoning linked:
   (one monotonic clock, honestly precise) vs. `feed_lag` (cross-clock,
   explicitly labeled approximate in its own metric text).
   [details](DECISIONS.md#two-latency-concepts-never-conflated)
-- **Five real bugs found by this project's own verification discipline**,
+- **Six real bugs found by this project's own verification discipline**,
   not by luck: an off-by-one at M1, a Hypothesis-found race at M2, two at
   M7 (a Hive-partition/schema bug that 92 passing tests didn't catch but
   one manual pandas check did, and a monotonic-vs-epoch timestamp bug the
-  stress test itself caught), and (the newest) a `ParquetSink` stall
-  livelock found live during a multi-hour unattended soak run, where a
-  queue kept filling and silently dropping rows for hours with no
-  exception ever raised.
+  stress test itself caught), a `ParquetSink` stall livelock found live
+  during a multi-hour unattended soak run (a queue kept filling and
+  silently dropping rows for hours with no exception ever raised), and
+  (the newest) a second soak run that caught a Binance reconnect wedge
+  masked by a `FeedSupervisor` restart path that was structurally
+  unreachable -- `feed_restart_counts` stayed 0 through 93 minutes of a
+  fully dead feed.
   [details](DECISIONS.md#m7-benchmark-report-stress-test-readme) /
-  [M8 livelock](DECISIONS.md#m8-parquetsink-stall-livelock-production-incident)
+  [M8 livelock](DECISIONS.md#m8-parquetsink-stall-livelock-production-incident) /
+  [M9 reconnect wedge](DECISIONS.md#m9-binance-reconnect-wedge--unreachable-supervisor-escalation-production-incident)
 
 ## Fault tolerance
 

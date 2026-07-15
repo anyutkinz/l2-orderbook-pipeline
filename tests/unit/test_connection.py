@@ -135,6 +135,35 @@ def test_connected_info_outage_duration() -> None:
     assert info.attempt == 1  # the attempt number that was in flight when this connect succeeded
 
 
+def test_outage_duration_spans_the_whole_episode_not_just_the_last_retry() -> None:
+    """Regression for the M9 soak incident: a real outage isn't one clean
+    disconnect -> connect pair, it's disconnect -> several failed reconnect
+    attempts (each itself calling disconnected() again) -> eventual
+    connect. `outage_duration_seconds` must measure from the *first*
+    disconnect of the episode, not get reset by every failed attempt in
+    between -- otherwise a 50-minute real outage gets logged as whatever
+    the last retry gap happened to be (observed live: OKX logged 21.2s for
+    an outage that was actually ~50 minutes)."""
+    clock = _FakeClock(start=0.0)
+    manager = ConnectionManager(BackoffPolicy(), random.Random(1), clock)
+
+    manager.connecting()
+    manager.connected()
+
+    clock.now = 100.0
+    manager.disconnected("test")  # outage begins here
+    manager.connecting()
+
+    clock.now = 3000.0  # ~48 minutes later: another failed attempt
+    manager.disconnected("test")
+    manager.connecting()
+
+    clock.now = 3021.2  # final, successful attempt -- last retry gap is 21.2s
+    info = manager.connected()
+
+    assert info.outage_duration_seconds == 3021.2 - 100.0
+
+
 def test_state_transitions() -> None:
     manager = ConnectionManager(BackoffPolicy(), random.Random(1), _FakeClock())
 

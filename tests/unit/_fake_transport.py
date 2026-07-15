@@ -39,6 +39,40 @@ def stalling_connector(_url: str) -> FakeWebSocket:
     return FakeWebSocket(_stall)
 
 
+class _AlwaysFailingConnector:
+    """A connector whose __aenter__ always raises -- for exercising a feed
+    client's reconnect loop against a connect phase that never succeeds
+    (T9: the M9 soak-test wedge, where the WS handshake itself never
+    completes rather than a connected socket going stale). Tracks call
+    count so tests can assert exactly how many attempts were made."""
+
+    def __init__(self, exc_factory: Callable[[], Exception]) -> None:
+        self._exc_factory = exc_factory
+        self.attempts = 0
+
+    def __call__(self, _url: str) -> _AlwaysFailingConnector:
+        self.attempts += 1
+        return self
+
+    async def __aenter__(self) -> _AlwaysFailingConnector:
+        raise self._exc_factory()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+def always_failing_connector(
+    exc_factory: Callable[[], Exception] | None = None,
+) -> _AlwaysFailingConnector:
+    """`exc_factory` defaults to a fresh gaierror-shaped OSError each call,
+    matching the getaddrinfo failures seen live; callers can pass their own
+    to simulate a different permanent failure class (e.g. TimeoutError, to
+    exercise the watchdog-labeled path instead of WS_DISCONNECTED)."""
+    return _AlwaysFailingConnector(
+        exc_factory or (lambda: OSError("[Errno 11001] getaddrinfo failed"))
+    )
+
+
 def scripted_connector(messages: list[str]) -> Callable[[str], FakeWebSocket]:
     """A connector that yields messages one at a time, then hangs forever
     once the script is exhausted (so the reader loop just waits quietly
@@ -147,16 +181,29 @@ class FakeHttpClient:
         responses: list[FakeHttpResponse] | None = None,
         default: FakeHttpResponse | None = None,
         delay_seconds: float = 0.0,
+        fail_first_n: int = 0,
+        fail_exc_factory: Callable[[], Exception] | None = None,
     ) -> None:
         self._responses = list(responses or [])
         self._default = default
         self._delay = delay_seconds
+        # `fail_first_n`: the first N .get() calls raise instead of
+        # returning a response -- for exercising a network-level failure
+        # (DNS, connection reset) on the snapshot-fetch path (T9), distinct
+        # from the existing 429/418 retry which returns a normal response
+        # object rather than raising.
+        self._fail_first_n = fail_first_n
+        self._fail_exc_factory = fail_exc_factory or (
+            lambda: OSError("[Errno 11001] getaddrinfo failed")
+        )
         self.calls: list[dict[str, Any]] = []
 
     async def get(self, url: str, params: dict[str, Any]) -> FakeHttpResponse:
         if self._delay:
             await asyncio.sleep(self._delay)
         self.calls.append({"url": url, "params": dict(params)})
+        if len(self.calls) <= self._fail_first_n:
+            raise self._fail_exc_factory()
         if self._responses:
             return self._responses.pop(0)
         if self._default is not None:
